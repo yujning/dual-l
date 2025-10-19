@@ -704,10 +704,10 @@ bool Bit2oCut(dict<SigBit, pool<SigBit>> &bit2cut)
 				} else {
 					// i 是非6：只在非6 区间内向后配对，避免重复对称检查
 					for (int j = i + 1; j < (int)n; ++j) {
-						// 都是非6（因为 j >= i+1 且 i >= six_num）
-						const pool<SigBit> &cut1 = cuts[i];
-						const pool<SigBit> &cut2 = cuts[j];
-						if (HasCommonLeaf(cut1, cut2)) continue;
+                                                // 都是非6（因为 j >= i+1 且 i >= six_num）
+                                                const pool<SigBit> &cut1 = cuts[i];
+                                                const pool<SigBit> &cut2 = cuts[j];
+                                                if (!HasCommonLeaf(cut1, cut2)) continue;
 						pool<SigBit> merged = cut1;
 						merged.insert(cut2.begin(), cut2.end());
 						if (merged.size() > 5) continue; // 超出输入数限制
@@ -3103,117 +3103,248 @@ RTLIL::Cell *addLut(Module *module, const pool<SigBit> &cut, const RTLIL::SigBit
 //     return ct;
 // }
 // Minimal-change upgraded addDualOutputLut
+// RTLIL::Cell* addDualOutputLut(Module *module,
+//                               const pool<SigBit> &cut,
+//                               const std::vector<SigBit> &outputs,dict<SigBit, pool<SigBit>> &bit2cut)
+// {
+//     if (outputs.size() != 2 || cut.size() < 1 || cut.size() > 6)
+//         return nullptr;
+
+//     SigBit out1 = outputs[0];
+//     SigBit out2 = outputs[1];
+
+//     // 获取各自 cut（已由 Bit2oCut 区分）
+//     pool<SigBit> cut1 = bit2cut[out1];
+//     pool<SigBit> cut2 = bit2cut[out2];
+
+//     std::vector<SigBit> vcut;
+//     vcut.insert(vcut.end(), cut.begin(), cut.end());
+
+//     // -----------------------------
+//     // 1️⃣ 识别是 6PI 融合 cut 还是 ≤5PI cut
+//     // -----------------------------
+//     bool isSubset6PI = false;
+//     if (cut1.size() == 6 && cut2.size() < 6) {
+//         bool subset = true;
+//         for (auto &b : cut2)
+//             if (!cut1.count(b)) subset = false;
+//         if (subset) isSubset6PI = true;
+//     }
+
+//     // -----------------------------
+//     // 2️⃣ 构建真值表 (INIT)
+//     // -----------------------------
+//     std::vector<bool> init64(64, false);
+
+//     if (isSubset6PI) {
+//         // 第一种：6PI融合cut
+//         // I5=0 → 输出 O1；I5=1 → 输出 O2
+//         std::vector<bool> init_o1 = GetCutInit(std::vector<SigBit>(cut1.begin(), cut1.end()), out1);
+//         std::vector<bool> init_o2 = GetCutInit(std::vector<SigBit>(cut1.begin(), cut1.end()), out2);
+
+//         for (int i = 0; i < 32; i++) {
+//             init64[i]      = init_o1[i % init_o1.size()]; // I5=0
+//             init64[i + 32] = init_o2[i % init_o2.size()]; // I5=1
+//         }
+
+//     } else {
+//     // I5 = 0 → O1;  I5 = 1 → O2
+//     std::vector<SigBit> inputs_o1(cut1.begin(), cut1.end());
+//     std::vector<SigBit> inputs_o2(cut2.begin(), cut2.end());
+
+//     // 生成各自真值表
+//     std::vector<bool> init_o1 = GetCutInit(inputs_o1, out1);
+//     std::vector<bool> init_o2 = GetCutInit(inputs_o2, out2);
+
+//     // 将每个真值表扩展到 5 输入（32 位）
+//     auto expand_to_5 = [](const std::vector<bool>& init) -> std::vector<bool> {
+//         int m = init.size();
+//         if (m == 32) return init;           // 已经是 5 输入
+//         int n = 32 / m;                     // 扩展倍数 (2^(5 - pi_num))
+//         std::vector<bool> res(32);
+//         for (int i = 0; i < 32; i++)
+//             res[i] = init[i % m];           // 复制方式扩展 don’t-care 维度
+//         return res;
+//     };
+
+//     std::vector<bool> init_o1_5 = expand_to_5(init_o1);
+//     std::vector<bool> init_o2_5 = expand_to_5(init_o2);
+
+//     // 拼接 LUT6D INIT
+//     for (int i = 0; i < 32; i++) {
+//         init64[i]      = init_o1_5[i]; // I5=0 → O1
+//         init64[i + 32] = init_o2_5[i]; // I5=1 → O2
+//     }
+// }
+
+//     // -----------------------------
+//     // 3️⃣ 创建 LUT6D 实例
+//     // -----------------------------
+//     Cell *drv = bit2driver[out1];
+//     log_assert(drv);
+//     IdString name = drv->name;
+//     string new_name = string(name.c_str()) + "_lut6d";
+//     Cell *ct = module->addCell(RTLIL::IdString(new_name), ID(GTP_LUT6D));
+
+//     // -----------------------------
+//     // 4️⃣ 设置输入端口（不足补常量）
+//     // -----------------------------
+//     for (size_t i = 0; i < 6; i++) {
+//         string pin_name = "\\I" + std::to_string(i);
+//         if (i < vcut.size())
+//             ct->setPort(RTLIL::IdString(pin_name), vcut[i]);
+//         else
+//             ct->setPort(RTLIL::IdString(pin_name), RTLIL::SigSpec(RTLIL::Const(1, 1))); // 逻辑1
+//     }
+
+//     // -----------------------------
+//     // 5️⃣ 设置输出端口
+//     // -----------------------------
+//     ct->setPort(ID(Z5), out1); // 子函数
+//     ct->setPort(ID(Z),  out2); // 主函数
+
+//     // -----------------------------
+//     // 6️⃣ 设置 INIT 参数
+//     // -----------------------------
+//     ct->parameters[ID::INIT] = RTLIL::Const(init64);
+
+//     // -----------------------------
+//     // 7️⃣ 源属性
+//     // -----------------------------
+//     ct->set_src_attribute(drv->get_src_attribute());
+
+//     return ct;
+// }
+
 RTLIL::Cell* addDualOutputLut(Module *module,
-                              const pool<SigBit> &cut,
-                              const std::vector<SigBit> &outputs,dict<SigBit, pool<SigBit>> &bit2cut)
+                              const pool<SigBit> &merged_cut,
+                              const std::vector<SigBit> &outputs,
+                              dict<SigBit, pool<SigBit>> &bit2cut)
 {
-    if (outputs.size() != 2 || cut.size() < 1 || cut.size() > 6)
+    if (outputs.size() != 2 || merged_cut.empty() || merged_cut.size() > 6)
         return nullptr;
 
-    SigBit out1 = outputs[0];
-    SigBit out2 = outputs[1];
+    SigBit out_a = outputs[0];
+    SigBit out_b = outputs[1];
+    pool<SigBit> cut_a = bit2cut[out_a];
+    pool<SigBit> cut_b = bit2cut[out_b];
 
-    // 获取各自 cut（已由 Bit2oCut 区分）
-    pool<SigBit> cut1 = bit2cut[out1];
-    pool<SigBit> cut2 = bit2cut[out2];
+    bool a_is6 = cut_a.size() == 6;
+    bool b_is6 = cut_b.size() == 6;
 
-    std::vector<SigBit> vcut;
-    vcut.insert(vcut.end(), cut.begin(), cut.end());
+    SigBit out_z = out_b;
+    SigBit out_z5 = out_a;
+    pool<SigBit> cut_z = cut_b;
+    pool<SigBit> cut_z5 = cut_a;
 
-    // -----------------------------
-    // 1️⃣ 识别是 6PI 融合 cut 还是 ≤5PI cut
-    // -----------------------------
-    bool isSubset6PI = false;
-    if (cut1.size() == 6 && cut2.size() < 6) {
-        bool subset = true;
-        for (auto &b : cut2)
-            if (!cut1.count(b)) subset = false;
-        if (subset) isSubset6PI = true;
+    if (a_is6 && !b_is6) {
+        out_z = out_a;
+        out_z5 = out_b;
+        cut_z = cut_a;
+        cut_z5 = cut_b;
+    } else if (b_is6 && !a_is6) {
+        out_z = out_b;
+        out_z5 = out_a;
+        cut_z = cut_b;
+        cut_z5 = cut_a;
+    } else if (a_is6 && b_is6) {
+        // 当前不支持 6PI + 6PI 融合
+        return nullptr;
     }
 
-    // -----------------------------
-    // 2️⃣ 构建真值表 (INIT)
-    // -----------------------------
-    std::vector<bool> init64(64, false);
+    dict<SigBit, int> pin_index;
+    std::vector<SigBit> pins;
 
-    if (isSubset6PI) {
-        // 第一种：6PI融合cut
-        // I5=0 → 输出 O1；I5=1 → 输出 O2
-        std::vector<bool> init_o1 = GetCutInit(std::vector<SigBit>(cut1.begin(), cut1.end()), out1);
-        std::vector<bool> init_o2 = GetCutInit(std::vector<SigBit>(cut1.begin(), cut1.end()), out2);
-
-        for (int i = 0; i < 32; i++) {
-            init64[i]      = init_o1[i % init_o1.size()]; // I5=0
-            init64[i + 32] = init_o2[i % init_o2.size()]; // I5=1
+    bool share_inputs = false;
+    for (auto bit : cut_z5)
+        if (cut_z.count(bit)) {
+            share_inputs = true;
+            break;
         }
 
-    } else {
-    // I5 = 0 → O1;  I5 = 1 → O2
-    std::vector<SigBit> inputs_o1(cut1.begin(), cut1.end());
-    std::vector<SigBit> inputs_o2(cut2.begin(), cut2.end());
+    if (!share_inputs)
+        return nullptr;
 
-    // 生成各自真值表
-    std::vector<bool> init_o1 = GetCutInit(inputs_o1, out1);
-    std::vector<bool> init_o2 = GetCutInit(inputs_o2, out2);
-
-    // 将每个真值表扩展到 5 输入（32 位）
-    auto expand_to_5 = [](const std::vector<bool>& init) -> std::vector<bool> {
-        int m = init.size();
-        if (m == 32) return init;           // 已经是 5 输入
-        int n = 32 / m;                     // 扩展倍数 (2^(5 - pi_num))
-        std::vector<bool> res(32);
-        for (int i = 0; i < 32; i++)
-            res[i] = init[i % m];           // 复制方式扩展 don’t-care 维度
-        return res;
+    auto add_cut_bits_unique = [&](const pool<SigBit> &cut) {
+        for (auto bit : cut) {
+            if (!pin_index.count(bit)) {
+                pin_index[bit] = pins.size();
+                pins.push_back(bit);
+            }
+        }
     };
 
-    std::vector<bool> init_o1_5 = expand_to_5(init_o1);
-    std::vector<bool> init_o2_5 = expand_to_5(init_o2);
+    add_cut_bits_unique(cut_z5);
+    add_cut_bits_unique(cut_z);
 
-    // 拼接 LUT6D INIT
-    for (int i = 0; i < 32; i++) {
-        init64[i]      = init_o1_5[i]; // I5=0 → O1
-        init64[i + 32] = init_o2_5[i]; // I5=1 → O2
+    if (pins.size() > 6)
+        return nullptr;
+
+    size_t input_count = pins.size();
+    bool z_uses_6_inputs = cut_z.size() == 6;
+
+    std::vector<bool> init64(64, false);
+    size_t comb_limit = 1ull << input_count;
+    for (size_t mask = 0; mask < comb_limit; ++mask) {
+        dict<SigBit, State> assignment;
+        for (size_t i = 0; i < input_count; ++i)
+            assignment[pins[i]] = ((mask >> i) & 1) ? State::S1 : State::S0;
+
+        State val_z = StateEval(assignment, out_z);
+        State val_z5 = StateEval(assignment, out_z5);
+        if (val_z == State::Sx || val_z5 == State::Sx)
+            log_error("Cannot evaluate dual-output LUT for %s/%s.\n",
+                      log_signal(out_z), log_signal(out_z5));
+
+        int idx_base = 0;
+        int o5_inputs = std::min<size_t>(5, input_count);
+        for (int i = 0; i < o5_inputs; ++i)
+            if ((mask >> i) & 1)
+                idx_base |= (1 << i);
+
+        if (!z_uses_6_inputs) {
+            // 两个输出均为 ≤5 输入：I5 接 1，使主输出使用上半区
+            init64[idx_base | (1 << 5)] = (val_z == State::S1);
+        } else {
+            // 6 输入 + 5 输入：第 6 个输入位作为 I5
+            bool i5_val = (mask >> 5) & 1;
+            init64[idx_base | (i5_val << 5)] = (val_z == State::S1);
+        }
+
+        // 仅在 I5=0 平面写入 5 输入函数
+        if (!z_uses_6_inputs || ((mask >> 5) & 1) == 0)
+            init64[idx_base] = (val_z5 == State::S1);
     }
-}
 
-    // -----------------------------
-    // 3️⃣ 创建 LUT6D 实例
-    // -----------------------------
-    Cell *drv = bit2driver[out1];
+    Cell *drv = bit2driver[out_z];
     log_assert(drv);
-    IdString name = drv->name;
-    string new_name = string(name.c_str()) + "_lut6d";
-    Cell *ct = module->addCell(RTLIL::IdString(new_name), ID(GTP_LUT6D));
+    IdString drv_name = drv->name;
+    std::string new_name = std::string(drv_name.c_str()) + "_lut6d";
+    Cell *cell = module->addCell(RTLIL::IdString(new_name), ID(GTP_LUT6D));
 
-    // -----------------------------
-    // 4️⃣ 设置输入端口（不足补常量）
-    // -----------------------------
-    for (size_t i = 0; i < 6; i++) {
-        string pin_name = "\\I" + std::to_string(i);
-        if (i < vcut.size())
-            ct->setPort(RTLIL::IdString(pin_name), vcut[i]);
-        else
-            ct->setPort(RTLIL::IdString(pin_name), RTLIL::SigSpec(RTLIL::Const(1, 1))); // 逻辑1
+    for (size_t i = 0; i < input_count && i < 6; ++i) {
+        std::string pin_name = "\\I" + std::to_string(i);
+        cell->setPort(RTLIL::IdString(pin_name), pins[i]);
     }
 
-    // -----------------------------
-    // 5️⃣ 设置输出端口
-    // -----------------------------
-    ct->setPort(ID(Z5), out1); // 子函数
-    ct->setPort(ID(Z),  out2); // 主函数
+    for (size_t i = input_count; i < 5; ++i) {
+        std::string pin_name = "\\I" + std::to_string(i);
+        cell->setPort(RTLIL::IdString(pin_name), RTLIL::SigSpec(RTLIL::Const(0, 1)));
+    }
 
-    // -----------------------------
-    // 6️⃣ 设置 INIT 参数
-    // -----------------------------
-    ct->parameters[ID::INIT] = RTLIL::Const(init64);
+    if (z_uses_6_inputs) {
+        log_assert(input_count == 6);
+        cell->setPort(RTLIL::IdString("\\I5"), pins[5]);
+    } else {
+        cell->setPort(RTLIL::IdString("\\I5"), RTLIL::SigSpec(RTLIL::Const(1, 1)));
+    }
 
-    // -----------------------------
-    // 7️⃣ 源属性
-    // -----------------------------
-    ct->set_src_attribute(drv->get_src_attribute());
+    cell->setPort(ID(Z), out_z);
+    cell->setPort(ID(Z5), out_z5);
+    cell->parameters[ID::INIT] = RTLIL::Const(init64);
+    cell->set_src_attribute(drv->get_src_attribute());
 
-    return ct;
+    return cell;
 }
 
 bool Cone2ToLUTs(Module *module,
@@ -3221,6 +3352,8 @@ bool Cone2ToLUTs(Module *module,
                 dict<std::pair<SigBit,SigBit>, pool<SigBit>> &twoOutputCuts)
 {
     static size_t vf_count = 0;
+
+ pool<SigBit> fused_outputs;
 
     // 1️⃣ 先处理 dual-output cut
     for (auto &p : twoOutputCuts) {
@@ -3231,7 +3364,14 @@ bool Cone2ToLUTs(Module *module,
 
         std::vector<SigBit> outputs = {out1, out2};
         Cell *lut = addDualOutputLut(module, inputs, outputs,bit2cut); // 需要实现 dual-output addLut
-        log_assert(lut);
+        if (!lut) {
+            log_warning("Bit2oCut: dual-output LUT build failed for %s/%s, falling back to single-output mapping.\n",
+                        log_signal(out1), log_signal(out2));
+            continue;
+        }
+
+        fused_outputs.insert(out1);
+        fused_outputs.insert(out2);
     }
 
     // 2️⃣ 再处理剩余的单输出 cut
@@ -3239,14 +3379,8 @@ bool Cone2ToLUTs(Module *module,
         SigBit out = p.first;
 
         // 已经在 dual-output 中处理过的输出就跳过
-        bool alreadyFused = false;
-        for (auto &toc : twoOutputCuts) {
-            if (toc.first.first == out || toc.first.second == out) {
-                alreadyFused = true;
-                break;
-            }
-        }
-        if (alreadyFused) continue;
+        if (fused_outputs.count(out))
+            continue;
 
         pool<SigBit> cut = p.second;
         Cell *lut = addLut(module, cut, out); // 单输出 LUT
