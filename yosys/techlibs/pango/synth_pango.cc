@@ -32,14 +32,15 @@ Implement of "Heuristics for Area Minimization in LUT-Based FPGA Technology Mapp
 #include <string.h>
 #include <fstream>
 #include <map>
+#include <cmath>
+#include <limits>
 #include <bits/stdc++.h>
 USING_YOSYS_NAMESPACE
 using namespace std;
 PRIVATE_NAMESPACE_BEGIN
 
 // -----------------------
-// global variables delare here
-bool Test = false;
+
 size_t MAX_CUT_SIZE_PRE_CELL = 300;
 size_t MAX_INTERATIONS = 3;
 size_t LUT_SIZE = 6;
@@ -48,13 +49,10 @@ dict<SigBit, pool<SigBit>> best_bit2cut;
 size_t cur_interation = 0;
 // using sigmap to get a unique name of each signal
 SigMap sigmap;
-
-// fast get reader or driver by sigbit
 dict<SigBit, Cell *> bit2driver;//信号和cell的映射
+// fast get reader or driver by sigbit
 dict<SigBit, vector<Cell *>> bit2reader;//fanout和cell的映射
 dict<Cell *, vector<SigBit>> cell2bits; // the first bit is output bits cell和fanin的映射
-static dict<SigBit, uint64_t> init_mask_cache;  // 真值表掩码缓存
-static dict<SigBit, uint8_t>  input_mask_cache; // 输入集合掩码缓存
 
 dict<Cell *, float> cell2OptDepth;
 dict<SigBit, float> bit2height;
@@ -81,7 +79,7 @@ float GetEstimatedFanout(SigBit bit);
 vector<bool> GetCutInit(const vector<SigBit> &cut, SigBit out);
 pool<Cell *> GetReaders(Cell *cell, RTLIL::IdString port = RTLIL::IdString());
 bool Bit2oCut(dict<SigBit, pool<SigBit>> &bit2cut) ;//核心
-
+State StateEval(dict<SigBit, State> &bit_map, SigBit out);
 void check2ocut();
 
 
@@ -247,29 +245,40 @@ SigBit GetCellOutput(Cell *cell)
 	auto &bits = cell2bits[cell];
 	return bits[0];
 }
+static int GetCellOutputCount(Cell *cell)
+{
+        log_assert(cell);
+        int count = 0;
+        for (auto &conn : cell->connections()) {
+                IdString portname = conn.first;
+                if (!yosys_celltypes.cell_output(cell->type, portname))
+                        continue;
+
+                RTLIL::SigSpec sig = sigmap(conn.second);
+                count += sig.size();
+        }
+        return count;
+}
+
 void GetCellInputsSet(Cell *cell, pool<SigBit> &inputs)
 {
-	log_assert(cell && inputs.empty() && cell2bits.count(cell));
-	auto &bits = cell2bits[cell];
-	int offset = 1;
-	// not support GTP_LUT6D now
-	// if(cell is dual output)
-	// offset=2
-	for (auto it = bits.begin() + offset; it != bits.end(); ++it) {
-		inputs.insert(*it);
-	}
+        log_assert(cell && inputs.empty() && cell2bits.count(cell));
+        auto &bits = cell2bits[cell];
+        int offset = GetCellOutputCount(cell);
+        log_assert(offset <= GetSize(bits));
+        for (auto it = bits.begin() + offset; it != bits.end(); ++it) {
+                inputs.insert(*it);
+        }
 }
 void GetCellInputsVector(Cell *cell, vector<SigBit> &inputs)
 {
-	log_assert(cell && inputs.empty() && cell2bits.count(cell));
-	auto &bits = cell2bits[cell];
-	int offset = 1;
-	// not support GTP_LUT6D now
-	// if(cell is dual output)
-	// offset=2
-	for (auto it = bits.begin() + offset; it != bits.end(); ++it) {
-		inputs.push_back(*it);
-	}
+        log_assert(cell && inputs.empty() && cell2bits.count(cell));
+        auto &bits = cell2bits[cell];
+        int offset = GetCellOutputCount(cell);
+        log_assert(offset <= GetSize(bits));
+        for (auto it = bits.begin() + offset; it != bits.end(); ++it) {
+                inputs.push_back(*it);
+        }
 }
 
 pool<Cell *> GetReaders(Cell *cell, RTLIL::IdString port)
@@ -395,7 +404,7 @@ void GetTopoSortedGates(Module *module, vector<Cell *> &gates)
 
 bool MapperMain(Module *module)
 {
-	CheckCellWidth(module);//初始化映射信息
+        CheckCellWidth(module);//初始化映射信息
 	vector<Cell *> gates;
 	GetTopoSortedGates(module, gates);//对gates排序
 	GenerateCuts(module);//对每个节点生成最初的cut，包括1-6input，存储在cell2cuts中
@@ -450,38 +459,36 @@ bool MapperMain(Module *module)
 			}
 		}
 	}
-	log_debug("Map cut to GTP_LUT\n");
-	if(Test){	
-		Bit2oCut( best_bit2cut) ;
-		//check2ocut();
-		Cone2ToLUTs(module, best_bit2cut,twoOutputCuts);
-	}
-	return true;
+        log_debug("Map cut to GTP_LUT\n");
+        twoOutputCuts.clear();
+        Bit2oCut(best_bit2cut);
+        Cone2ToLUTs(module, best_bit2cut, twoOutputCuts);
+        return true;
 }
 
 // -----------------------
 bool MapperInit(Module *module)
 {
-	log_debug("Pango init\n");
-	SetPangoCellTypes(&yosys_celltypes);
+        log_debug("Pango init\n");
+        SetPangoCellTypes(&yosys_celltypes);
 
-	best_bit2cut.clear();
-	cur_interation = 0;
-	bit2driver.clear();
-	bit2reader.clear();
-	cell2bits.clear();
+        best_bit2cut.clear();
+        cur_interation = 0;
+        bit2driver.clear();
+        bit2reader.clear();
+        cell2bits.clear();
 
-	cell2OptDepth.clear();
-	bit2height.clear();
-	bit2depth.clear();
-	bit2af.clear();
-	bit2fanout_est.clear();
-	cell2cuts.clear();
-	sigmap.set(module);
-	
-	return true;
+        cell2OptDepth.clear();
+        bit2height.clear();
+        bit2depth.clear();
+        bit2af.clear();
+        bit2fanout_est.clear();
+        cell2cuts.clear();
+        twoOutputCuts.clear();
+        sigmap.set(module);
+
+        return true;
 }
-
 // bool HasCommonLeaf(const pool<SigBit> &cut1, const pool<SigBit> &cut2) {
 //     for (auto &sig : cut1) {
 //         if (cut2.count(sig)) return true;
@@ -507,116 +514,76 @@ bool HasCommonLeaf(const pool<SigBit> &cut1, const pool<SigBit> &cut2)
 bool CheckCutEquiv(const pool<SigBit>& cut1, SigBit out1,
                    const pool<SigBit>& cut2, SigBit out2)
 {
+    const pool<SigBit> *six_cut = nullptr;
+    const pool<SigBit> *five_cut = nullptr;
+    SigBit six_out, five_out;
 
-    auto GetCutMaskCached = [&](const pool<SigBit>& cut, SigBit out) -> uint64_t {
-        if (!init_mask_cache.count(out)) {
-            std::vector<SigBit> vec(cut.begin(), cut.end());
-            std::vector<bool> tb = GetCutInit(vec, out);
-            uint64_t val = 0;
-            for (size_t i = 0; i < tb.size(); i++)
-                if (tb[i]) val |= (1ull << i);
-            init_mask_cache[out] = val;
-        }
-        return init_mask_cache[out];
-    };
+    if (cut1.size() == 6 && cut2.size() == 5) {
+        six_cut = &cut1;
+        five_cut = &cut2;
+        six_out = out1;
+        five_out = out2;
+    } else if (cut2.size() == 6 && cut1.size() == 5) {
+six_cut = &cut2;
+five_cut = &cut1;
+        six_out = out2;
+        five_out = out1;
+    } else {
+        return false;
+    }
 
-    auto GetInputMaskCached = [&](const pool<SigBit>& cut, SigBit out) -> uint8_t {
-        if (!input_mask_cache.count(out)) {
-            std::vector<SigBit> vec(cut.begin(), cut.end());
-            uint8_t mask = 0;
-            for (int i = 0; i < (int)vec.size() && i < 6; i++)
-                mask |= (1 << i);
-            input_mask_cache[out] = mask;
-        }
-        return input_mask_cache[out];
-    };
+    std::vector<SigBit> five_inputs;
+    for (auto bit : *five_cut)
+        five_inputs.push_back(bit);
 
-    uint64_t mask1 = GetCutMaskCached(cut1, out1);
-    uint64_t mask2 = GetCutMaskCached(cut2, out2);
-    uint8_t imask1 = GetInputMaskCached(cut1, out1);
-    uint8_t imask2 = GetInputMaskCached(cut2, out2);
+    pool<SigBit> subset_bits;
+    for (auto &bit : five_inputs) {
+        if (subset_bits.count(bit))
+            return false;
+subset_bits.insert(bit);
+        if (!six_cut->count(bit))
+            return false;
+    }
 
-    int pi1 = cut1.size();
-    int pi2 = cut2.size();
-    if (pi1 != 6 || pi2 > 5)
+    std::vector<SigBit> six_inputs;
+    six_inputs.reserve(6);
+    for (auto &bit : five_inputs)
+        six_inputs.push_back(bit);
+    for (auto bit : *six_cut)
+        if (!subset_bits.count(bit))
+            six_inputs.push_back(bit);
+
+    if (six_inputs.size() != 6)
         return false;
 
-    // f=0平面：mask1 的低 32 位
-    uint32_t f0plane = (uint32_t)(mask1 & 0xFFFFFFFFull);
-    uint32_t mask_small = (uint32_t)(mask2 & 0xFFFFFFFFull);
+    auto eval_mask = [&](const std::vector<SigBit> &inputs, SigBit out, uint64_t &mask) -> bool {
+        mask = 0;
+        size_t limit = 1ull << inputs.size();
+        for (size_t idx = 0; idx < limit; ++idx) {
+            dict<SigBit, State> assignment;
+            for (size_t b = 0; b < inputs.size(); ++b)
+                assignment[inputs[b]] = ((idx >> b) & 1) ? State::S1 : State::S0;
 
-    // cut2 必须完全包含在 cut1 的前 5 位
-    if ((imask2 & 0x1F) != imask2)
+            State val = StateEval(assignment, out);
+            if (val == State::Sx)
+                return false;
+            if (val == State::S1)
+                mask |= (1ull << idx);
+        }
+        return true;
+    };
+
+    uint64_t mask6 = 0, mask5 = 0;
+    if (!eval_mask(six_inputs, six_out, mask6))
+        return false;
+    if (!eval_mask(five_inputs, five_out, mask5))
         return false;
 
-    bool eq = (f0plane == mask_small);
-#ifdef DEBUG_EQUIV
-    if (eq)
-        log_debug("CheckCutEquiv: %s == %s ✅\n", log_signal(out1), log_signal(out2));
-#endif
-    return eq;
+ uint32_t plane0 = static_cast<uint32_t>(mask6 & 0xFFFFFFFFFFull); 
+    uint32_t expected = static_cast<uint32_t>(mask5 & 0xFFFFFFFFull);
+    return plane0 == expected;
 }
 
-// bool CheckCutEquiv(const pool<SigBit>& cut1, SigBit out1,
-//                    const pool<SigBit>& cut2, SigBit out2)
-// {
-//     // 获取两个cut的真值表
-//     std::vector<SigBit> vec_cut1(cut1.begin(), cut1.end());
-//     std::vector<SigBit> vec_cut2(cut2.begin(), cut2.end());
-
-//     std::vector<bool> init1 = GetCutInit(vec_cut1, out1); // cut1 可能为6PI
-//     std::vector<bool> init2 = GetCutInit(vec_cut2, out2); // cut2 <=5PI
-
-//     int pi1 = cut1.size();
-//     int pi2 = cut2.size();
-
-//     // --- 情况检查 ---
-//     if (pi1 != 6 || pi2 > 5)
-//         return false; // 只处理 6PI + ≤5PI 情况
-
-//     // --- 从 cut1 的 64bit INIT 中提取 f=0 面 ---
-//     std::vector<bool> tb_f0(init1.begin(), init1.begin() + 32);
-
-//     // --- 扩展 cut2 真值表到5输入 ---
-//     auto expand_to_5 = [](const std::vector<bool>& tb) {
-//         int m = tb.size();
-//         if (m == 32) return tb;
-//         std::vector<bool> res(32);
-//         int ratio = 32 / m;
-//         for (int i = 0; i < 32; i++)
-//             res[i] = tb[i % m];
-//         return res;
-//     };
-
-//     std::vector<bool> tb_small_5 = expand_to_5(init2);
-
-//     // --- 构建输入对齐映射 ---
-//     std::vector<SigBit> inputs5;
-//     inputs5.reserve(5);
-//     for (auto &bit : vec_cut1) inputs5.push_back(bit);
-//     if (inputs5.size() > 5) inputs5.resize(5); // I5不参与比较
-
-//     // 检查cut2中的输入是否都在cut1的前5输入里
-//     for (auto &b : vec_cut2)
-//         if (std::find(inputs5.begin(), inputs5.end(), b) == inputs5.end())
-//             return false; // cut2的输入不匹配cut1前5位
-
-//     // --- 真值表等价检测 ---
-//     bool eq = true;
-//     for (int i = 0; i < 32; i++) {
-//         if (tb_f0[i] != tb_small_5[i]) {
-//             eq = false;
-//             break;
-//         }
-//     }
-
-//     if (eq)
-//         log_debug("CheckCutEquiv: %s == %s on f=0 plane ✅\n", log_signal(out1), log_signal(out2));
-//     else
-//         log_debug("CheckCutEquiv: %s != %s ❌\n", log_signal(out1), log_signal(out2));
-
-//     return eq;
-// }
 int SortCutLevel(const vector<Cell*> &cells_in_level,
                   dict<SigBit, pool<SigBit>> &bit2cut,
                   vector<pair<Cell*, int>> &cell_pi_list)
@@ -649,6 +616,7 @@ int SortCutLevel(const vector<Cell*> &cells_in_level,
 bool Bit2oCut(dict<SigBit, pool<SigBit>> &bit2cut)
 {
     log("Bit2oCut: entry, bit2cut size = %ld\n", bit2cut.size());
+    twoOutputCuts.clear();
     pool<SigBit> fused_outputs;
     dict<int, vector<Cell*>> level2cells;
 
@@ -677,12 +645,22 @@ bool Bit2oCut(dict<SigBit, pool<SigBit>> &bit2cut)
 			std::map<std::pair<int,int>, pool<SigBit>> edgeMergedCut;
 
 			// 为性能，提前把每个节点的 out 和 cut 提取到数组
-			vector<SigBit> outs(n);
-			vector<pool<SigBit>> cuts(n);
-			for (size_t i = 0; i < n; ++i) {
-				outs[i] = GetCellOutput(cell_pi_list[i].first);
-				cuts[i] = bit2cut[outs[i]];
-			}
+                        vector<SigBit> outs(n);
+                        vector<pool<SigBit>> cuts(n);
+                        for (size_t i = 0; i < n; ++i) {
+                                outs[i] = GetCellOutput(cell_pi_list[i].first);
+                                cuts[i] = bit2cut[outs[i]];
+                        }
+
+                        auto is_cost_improving = [&](int ia, int ib, const pool<SigBit> &cut_a, const pool<SigBit> &cut_b, const pool<SigBit> &merged) {
+                                float level = std::max(bit2depth[outs[ia]], bit2depth[outs[ib]]);
+                                float level_term = (level / 20.0f) + 1.0f;
+                                int pin_before = cut_a.size() + cut_b.size();
+                                int pin_after = merged.size();
+                                float cost_before = level_term * 2.0f * 10.0f + pin_before;
+                                float cost_after = level_term * 1.0f * 10.0f + pin_after;
+                                return cost_after + 1e-3f < cost_before;
+                        };
 
 			// 构建边 (遵循你对 6PI / 非6 的规则)
 			for (int i = 0; i < (int)n; ++i) {
@@ -694,28 +672,33 @@ bool Bit2oCut(dict<SigBit, pool<SigBit>> &bit2cut)
 						const pool<SigBit> &cut1 = cuts[i];
 						const pool<SigBit> &cut2 = cuts[j];
 						if (cut2.size() == 6) continue; // second must be <6
-						if (!CheckCutEquiv(cut1, outs[i], cut2, outs[j])) continue;
-						// 可融合：记录无向边 i <-> j
-						adj[i].push_back(j);
-						adj[j].push_back(i);
-						// 存合并结果（你原来把 merged = cut1）
-						edgeMergedCut[{i, j}] = cut1;
-					}
-				} else {
-					// i 是非6：只在非6 区间内向后配对，避免重复对称检查
-					for (int j = i + 1; j < (int)n; ++j) {
+                                                if (!CheckCutEquiv(cut1, outs[i], cut2, outs[j])) continue;
+                                                pool<SigBit> merged = cut1;
+                                                if (!is_cost_improving(i, j, cut1, cut2, merged))
+                                                        continue;
+                                                // 可融合：记录无向边 i <-> j
+                                                adj[i].push_back(j);
+                                                adj[j].push_back(i);
+                                                // 存合并结果（你原来把 merged = cut1）
+                                                edgeMergedCut[{i, j}] = merged;
+                                        }
+                                } else {
+                                        // i 是非6：只在非6 区间内向后配对，避免重复对称检查
+                                        for (int j = i + 1; j < (int)n; ++j) {
                                                 // 都是非6（因为 j >= i+1 且 i >= six_num）
                                                 const pool<SigBit> &cut1 = cuts[i];
                                                 const pool<SigBit> &cut2 = cuts[j];
                                                 if (!HasCommonLeaf(cut1, cut2)) continue;
-						pool<SigBit> merged = cut1;
-						merged.insert(cut2.begin(), cut2.end());
-						if (merged.size() > 5) continue; // 超出输入数限制
-						// 可融合：记录无向边
-						adj[i].push_back(j);
-						adj[j].push_back(i);
-						// 存合并结果（注意键用有序 pair）
-						edgeMergedCut[{i, j}] = merged;
+                                                pool<SigBit> merged = cut1;
+                                                merged.insert(cut2.begin(), cut2.end());
+                                                if (merged.size() > 5) continue; // 超出输入数限制
+                                                if (!is_cost_improving(i, j, cut1, cut2, merged))
+                                                        continue;
+                                                // 可融合：记录无向边
+                                                adj[i].push_back(j);
+                                                adj[j].push_back(i);
+                                                // 存合并结果（注意键用有序 pair）
+                                                edgeMergedCut[{i, j}] = merged;
 					}
 				}
 			}
@@ -739,9 +722,7 @@ bool Bit2oCut(dict<SigBit, pool<SigBit>> &bit2cut)
 
         // 记录双输出cut（由上层统一处理）
        twoOutputCuts[{outs[i], outs[j]}] = merged_cut;
-    	}
-		init_mask_cache.clear();
-		input_mask_cache.clear();
+        }
     }
     log("Bit2oCut: exit, twoOutputCuts size = %ld\n", twoOutputCuts.size());
     return true;
@@ -750,64 +731,76 @@ bool Bit2oCut(dict<SigBit, pool<SigBit>> &bit2cut)
 
 bool GetBestCut(Cell *cell, pool<SigBit> &cut_selected)
 {
-	cut_selected.clear();
-	// depth-oriented cut selection
-	const dict<pool<SigBit>, pool<Cell *>> &cuts = cell2cuts[cell];//取得cell所有cut组
-	if (cuts.size() == 1) {
-		cut_selected = cuts.begin()->first;
-		return cut_selected.size() > 0;
-	}
-	float selected_depth = 1e9;
-	float selected_af = 1e9;
-	log_assert(cuts.size() > 0);
+        cut_selected.clear();
+        // depth-oriented cut selection
+        const dict<pool<SigBit>, pool<Cell *>> &cuts = cell2cuts[cell];//取得cell所有cut组
+        if (cuts.size() == 1) {
+                cut_selected = cuts.begin()->first;
+                return cut_selected.size() > 0;
+        }
+        log_assert(cuts.size() > 0);
 
-	float min_af = 1e9;
-	pool<SigBit> min_af_cut;
-	for (auto cutpair : cuts) {
-		pool<SigBit> cur_cut = cutpair.first;//取得cuts池中某一个cut的sigbit集合
-		float cur_depth = -1e9;
-		float cur_af = 0;
-		for (auto &bit : cur_cut) {
-			cur_depth = max(bit2depth[bit], cur_depth);
-			cur_af += bit2af[bit];
-		}
+        const float depth_norm = 20.0f;
+        const float depth_eps = 0.01f;
+        const float cost_eps = 0.01f;
 
-		if (cur_af < min_af) {
-			min_af = cur_af;
-			min_af_cut = cur_cut;
-		}
+        float selected_depth = std::numeric_limits<float>::infinity();
+        float selected_cost = std::numeric_limits<float>::infinity();
+        float best_fallback_cost = std::numeric_limits<float>::infinity();
+        pool<SigBit> best_fallback_cut;
+        SigBit outbit = GetCellOutput(cell);
 
-		if (0 == cur_interation) {//首次迭代优先深度
-			if (abs(cur_depth - selected_depth) < 0.01 && cur_af < selected_af) {
-				cut_selected = cur_cut;
-				selected_depth = cur_depth;
-				selected_af = cur_af;
-			} else if (cur_depth < selected_depth) {
-				cut_selected = cur_cut;
-				selected_depth = cur_depth;
-				selected_af = cur_af;
-			}
-		} else {//后续迭代优先面积
-			SigBit outbit = GetCellOutput(cell);
-			if (cur_depth > cell2OptDepth[cell] - bit2height[outbit]) {
-				continue;
-			}
-			if (cur_af < selected_af) {
-				cut_selected = cur_cut;
-				selected_depth = cur_depth;
-				selected_af = cur_af;
-			}
-		}
-	}
+        for (auto cutpair : cuts) {
+                pool<SigBit> cur_cut = cutpair.first;//取得cuts池中某一个cut的sigbit集合
+                if (cur_cut.empty())
+                        continue;
 
-	if (cut_selected.size() == 0) {
-		// choose nothing
-		//log_warning("cell %s not selected any cut at interation %ld\n", cell->name.c_str(), cur_interation);
-		cut_selected = min_af_cut;
-	}
-	return cut_selected.size() > 0;
+                float cur_depth = 0.0f;
+                float cur_area = 0.0f;
+                for (auto &bit : cur_cut) {
+                        cur_depth = max(bit2depth[bit], cur_depth);
+                        cur_area += bit2af[bit];
+                }
+
+                float est_luts = cur_area + 1.0f;
+                float depth_term = (cur_depth + 1.0f) / depth_norm + 1.0f;
+                float cur_cost = depth_term * est_luts * 10.0f + cur_cut.size();
+
+                if (cur_cost < best_fallback_cost) {
+                        best_fallback_cost = cur_cost;
+                        best_fallback_cut = cur_cut;
+                }
+
+                if (0 == cur_interation) {//首次迭代优先深度
+                        if (cur_depth + depth_eps < selected_depth) {
+                                cut_selected = cur_cut;
+                                selected_depth = cur_depth;
+                                selected_cost = cur_cost;
+                        } else if (fabs(cur_depth - selected_depth) <= depth_eps && cur_cost + cost_eps < selected_cost) {
+                                cut_selected = cur_cut;
+                                selected_cost = cur_cost;
+                        }
+                } else {//后续迭代优先面积（改为综合 cost）
+                        if (cur_depth > cell2OptDepth[cell] - bit2height[outbit]) {
+                                continue;
+                        }
+                        if (cur_cost + cost_eps < selected_cost) {
+                                cut_selected = cur_cut;
+                                selected_depth = cur_depth;
+                                selected_cost = cur_cost;
+                        } else if (fabs(cur_cost - selected_cost) <= cost_eps && cur_depth < selected_depth - depth_eps) {
+                                cut_selected = cur_cut;
+                                selected_depth = cur_depth;
+                        }
+                }
+        }
+
+        if (cut_selected.size() == 0) {
+                // choose best cost cut as fallback
+                cut_selected = best_fallback_cut;
+        }
+        return cut_selected.size() > 0;
 }
-
 float GetEstimatedFanout(SigBit bit)
 {
 	float alpha = 2.5;
@@ -3042,179 +3035,6 @@ RTLIL::Cell *addLut(Module *module, const pool<SigBit> &cut, const RTLIL::SigBit
 	}
 	return cell;
 }
-// map selected cut in bit2cut to GTP_LUT
-// RTLIL::Cell* addDualOutputLut(Module *module,
-//                               const pool<SigBit> &cut,
-//                               const std::vector<SigBit> &outputs,dict<SigBit, pool<SigBit>> &bit2cut)
-// {
-// 	//log("start 2ocut lutmapping\n");
-//     // 1️⃣ 检查输入输出合法性
-//     if (outputs.size() != 2 || cut.size() > 6 || cut.size() < 1) return nullptr;
-
-//     // 2️⃣ 准备输入向量，补齐到6
-//     vector<SigBit> vcut;
-//     for (auto bit : cut) vcut.push_back(bit);
-// if (cut.size() == 6) {
-//     // 找到子集中没有的线，接 I5
-//     pool<SigBit> cut1 = bit2cut[outputs[0]];
-//     pool<SigBit> cut2 = bit2cut[outputs[1]];
-//     for (auto &b : cut1) {
-//         if (!cut2.count(b)) { 
-//             vcut[5] = b; 
-//             break;
-//         }
-//     }
-// } else if (cut.size() < 6) {
-//     // PI 总数 <=5，I5 接 VCC
-//     vcut.push_back(GetVCC(module));
-// }
-
-// // 补齐剩余输入到 6 个
-// while (vcut.size() < 6) {
-//     SigBit dummy; 
-//     vcut.push_back(dummy);
-// }
-//     // 3️⃣ 生成 INIT 参数
-// 	vector<bool> cut_init_bools = GetCutInit(vcut, outputs[0]); // 只用第一个输出生成 INIT
-
-//     // 4️⃣ 生成 cell 名称
-//     Cell *drv = bit2driver[outputs[0]];
-//     log_assert(drv);
-//     IdString name = drv->name;
-//     string new_name = string(name.c_str()) + "_lut6d"; // 双输出特殊标识
-// 	//std::cout<<"name : "<<new_name<<std::endl;
-//     Cell *ct = module->addCell(RTLIL::IdString(new_name), ID(GTP_LUT6D)); // 选择 GTP_LUT6D
-
-//     // 6️⃣ 设置端口，沿用原风格
-//     for (size_t i = 0; i < vcut.size(); ++i) {
-//         string pin_name = "\\I" + to_string(i); // 输入端口
-//         ct->setPort(RTLIL::IdString(pin_name), vcut[i]);
-//     }
-
-//     ct->setPort(ID(Z), outputs[0]);
-//     ct->setPort(ID(Z5), outputs[1]);
-
-//     // 7️⃣ 设置 INIT
-//     ct->parameters[ID::INIT] = RTLIL::Const(cut_init_bools);
-
-//     // 8️⃣ 设置源信息
-//     ct->set_src_attribute(drv->get_src_attribute());
-
-//     return ct;
-// }
-// Minimal-change upgraded addDualOutputLut
-// RTLIL::Cell* addDualOutputLut(Module *module,
-//                               const pool<SigBit> &cut,
-//                               const std::vector<SigBit> &outputs,dict<SigBit, pool<SigBit>> &bit2cut)
-// {
-//     if (outputs.size() != 2 || cut.size() < 1 || cut.size() > 6)
-//         return nullptr;
-
-//     SigBit out1 = outputs[0];
-//     SigBit out2 = outputs[1];
-
-//     // 获取各自 cut（已由 Bit2oCut 区分）
-//     pool<SigBit> cut1 = bit2cut[out1];
-//     pool<SigBit> cut2 = bit2cut[out2];
-
-//     std::vector<SigBit> vcut;
-//     vcut.insert(vcut.end(), cut.begin(), cut.end());
-
-//     // -----------------------------
-//     // 1️⃣ 识别是 6PI 融合 cut 还是 ≤5PI cut
-//     // -----------------------------
-//     bool isSubset6PI = false;
-//     if (cut1.size() == 6 && cut2.size() < 6) {
-//         bool subset = true;
-//         for (auto &b : cut2)
-//             if (!cut1.count(b)) subset = false;
-//         if (subset) isSubset6PI = true;
-//     }
-
-//     // -----------------------------
-//     // 2️⃣ 构建真值表 (INIT)
-//     // -----------------------------
-//     std::vector<bool> init64(64, false);
-
-//     if (isSubset6PI) {
-//         // 第一种：6PI融合cut
-//         // I5=0 → 输出 O1；I5=1 → 输出 O2
-//         std::vector<bool> init_o1 = GetCutInit(std::vector<SigBit>(cut1.begin(), cut1.end()), out1);
-//         std::vector<bool> init_o2 = GetCutInit(std::vector<SigBit>(cut1.begin(), cut1.end()), out2);
-
-//         for (int i = 0; i < 32; i++) {
-//             init64[i]      = init_o1[i % init_o1.size()]; // I5=0
-//             init64[i + 32] = init_o2[i % init_o2.size()]; // I5=1
-//         }
-
-//     } else {
-//     // I5 = 0 → O1;  I5 = 1 → O2
-//     std::vector<SigBit> inputs_o1(cut1.begin(), cut1.end());
-//     std::vector<SigBit> inputs_o2(cut2.begin(), cut2.end());
-
-//     // 生成各自真值表
-//     std::vector<bool> init_o1 = GetCutInit(inputs_o1, out1);
-//     std::vector<bool> init_o2 = GetCutInit(inputs_o2, out2);
-
-//     // 将每个真值表扩展到 5 输入（32 位）
-//     auto expand_to_5 = [](const std::vector<bool>& init) -> std::vector<bool> {
-//         int m = init.size();
-//         if (m == 32) return init;           // 已经是 5 输入
-//         int n = 32 / m;                     // 扩展倍数 (2^(5 - pi_num))
-//         std::vector<bool> res(32);
-//         for (int i = 0; i < 32; i++)
-//             res[i] = init[i % m];           // 复制方式扩展 don’t-care 维度
-//         return res;
-//     };
-
-//     std::vector<bool> init_o1_5 = expand_to_5(init_o1);
-//     std::vector<bool> init_o2_5 = expand_to_5(init_o2);
-
-//     // 拼接 LUT6D INIT
-//     for (int i = 0; i < 32; i++) {
-//         init64[i]      = init_o1_5[i]; // I5=0 → O1
-//         init64[i + 32] = init_o2_5[i]; // I5=1 → O2
-//     }
-// }
-
-//     // -----------------------------
-//     // 3️⃣ 创建 LUT6D 实例
-//     // -----------------------------
-//     Cell *drv = bit2driver[out1];
-//     log_assert(drv);
-//     IdString name = drv->name;
-//     string new_name = string(name.c_str()) + "_lut6d";
-//     Cell *ct = module->addCell(RTLIL::IdString(new_name), ID(GTP_LUT6D));
-
-//     // -----------------------------
-//     // 4️⃣ 设置输入端口（不足补常量）
-//     // -----------------------------
-//     for (size_t i = 0; i < 6; i++) {
-//         string pin_name = "\\I" + std::to_string(i);
-//         if (i < vcut.size())
-//             ct->setPort(RTLIL::IdString(pin_name), vcut[i]);
-//         else
-//             ct->setPort(RTLIL::IdString(pin_name), RTLIL::SigSpec(RTLIL::Const(1, 1))); // 逻辑1
-//     }
-
-//     // -----------------------------
-//     // 5️⃣ 设置输出端口
-//     // -----------------------------
-//     ct->setPort(ID(Z5), out1); // 子函数
-//     ct->setPort(ID(Z),  out2); // 主函数
-
-//     // -----------------------------
-//     // 6️⃣ 设置 INIT 参数
-//     // -----------------------------
-//     ct->parameters[ID::INIT] = RTLIL::Const(init64);
-
-//     // -----------------------------
-//     // 7️⃣ 源属性
-//     // -----------------------------
-//     ct->set_src_attribute(drv->get_src_attribute());
-
-//     return ct;
-// }
 
 RTLIL::Cell* addDualOutputLut(Module *module,
                               const pool<SigBit> &merged_cut,
@@ -3502,19 +3322,16 @@ struct testpass:public ScriptPass{
 	bool Score =false;
 	string top_module_name;
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override{
-		for (auto &arg : args) {
-            if (arg == "-t") {
-                Test = true;
-            }
-			else if (arg == "-h") {
+        for (auto &arg : args) {
+                if (arg == "-h") {
                 log("\nUsage: test_pango [options]\n");
-                log("  -t     Enable TEST mode\n");
                 log("  -h     Show this help message\n\n");
-                return; // 打印帮助后退出，不执行脚本
+                return; //Exit after printing the help without executing the script 
             }
-			else if (arg == "-c") {
-				Score =true;
+                else if (arg == "-c") {
+                        Score = true;
             }
+        
         }
 		log_header(design, "Start test_pango\n");
 		log_push();
