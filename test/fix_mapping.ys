@@ -1,0 +1,30 @@
+# 修复Pango映射问题的Yosys脚本
+# 这个脚本添加了技术映射步骤，将内部单元映射到GTP_LUT
+
+# 读取设计文件
+read_verilog -icells /home/yujingning/ziguang/test/design_1.v
+
+# 设置顶层模块
+hierarchy -top design_1
+
+# 保存映射前的设计
+design -save before_map
+
+# 使用Pango映射器
+mapper
+
+# 添加技术映射步骤，将内部单元映射到GTP_LUT
+# 首先尝试使用标准的技术映射
+techmap -map +/techmap.v
+
+# 如果还有未映射的内部单元，尝试使用简单的映射
+simplemap
+
+# 检查映射结果
+check -mapped
+
+# 写入修复后的设计
+write_verilog -noattr -noexpr /home/yujingning/ziguang/test/design_1_fixed.v
+
+# 显示映射统计信息
+stat
