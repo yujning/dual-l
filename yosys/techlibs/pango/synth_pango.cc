@@ -62,7 +62,6 @@ dict<SigBit, size_t> bit2fanout_est;
 dict<std::pair<SigBit,SigBit>,pool<SigBit>> twoOutputCuts;
 dict<Cell *, dict<pool<SigBit>, pool<Cell *>>> cell2cuts; // cell -> dict<cut, cone>
 bool using_internel_lut_type = false;
-
 //-------------------------------
 // functions declare here
 bool MapperMain(Module *module);
@@ -235,118 +234,7 @@ bool IsGTP(Cell *cell) { return cell->type.begins_with("\\GTP_"); }
 bool IsCombinationalGate(Cell *cell) { return IsAND(cell) || IsOR(cell) || IsNOT(cell) || IsMUX(cell) || IsXOR(cell); }
 bool IsCombinationalCell(Cell *cell)
 {
-        return IsAND(cell) || IsOR(cell) || IsNOT(cell) || IsMUX(cell) || IsXOR(cell) || IsGTP_LUT(cell) || IsGTP_LUT6D(cell);
-}
-
-static bool CollectDependInputsForCost(SigBit obit, pool<SigBit> &depend_inputs)
-{
-        depend_inputs.clear();
-        auto drv_it = bit2driver.find(obit);
-        if (drv_it == bit2driver.end())
-                return false;
-
-        Cell *drv = drv_it->second;
-        if (!IsCombinationalCell(drv))
-                return false;
-
-        bool is_gtp_lut6d = IsGTP_LUT6D(drv);
-        IdString output_port_name;
-        std::vector<SigBit> input_bits;
-        size_t lut_input_width = 0;
-
-        for (auto &conn : drv->connections()) {
-                IdString portname = conn.first;
-                RTLIL::SigSpec sig = sigmap(conn.second);
-                if (yosys_celltypes.cell_output(drv->type, portname)) {
-                        for (int i = 0; i < sig.size(); ++i) {
-                                if (sig[i] == obit)
-                                        output_port_name = portname;
-                        }
-                        continue;
-                }
-
-                if (!yosys_celltypes.cell_input(drv->type, portname))
-                        continue;
-
-                if (sig.size() != 1)
-                        log_warning("cell %s port %s connect %d bit.\n", drv->name.c_str(), portname.c_str(), sig.size());
-
-                SigBit bit = sig.as_bit();
-                if (!is_gtp_lut6d) {
-                        input_bits.push_back(bit);
-                        continue;
-                }
-
-                const char *port_name_p = portname.c_str();
-                if (*port_name_p == '\\')
-                        ++port_name_p;
-                if (*port_name_p != 'I')
-                        continue;
-
-                char num = *(port_name_p + 1) - '0';
-                if (num < 0 || num >= 6)
-                        continue;
-
-                if (size_t(num + 1) > input_bits.size())
-                        input_bits.resize(num + 1);
-                input_bits[num] = bit;
-                lut_input_width = std::max(lut_input_width, size_t(num + 1));
-        }
-
-        if (is_gtp_lut6d)
-                input_bits.resize(lut_input_width);
-
-        if (!output_port_name.size())
-                return false;
-
-        if (!is_gtp_lut6d) {
-                for (auto &bit : input_bits)
-                        if (bit.is_wire())
-                                depend_inputs.insert(bit);
-                return true;
-        }
-
-        if (!drv->hasParam(ID::INIT))
-                return false;
-
-        Const initval = drv->getParam(ID::INIT);
-        if (initval.size() != 64)
-                return false;
-
-        auto accumulate_depend_bits = [&](const Const &table, size_t max_inputs) {
-                int table_size = table.size();
-                for (size_t i = 0; i < max_inputs && i < input_bits.size(); ++i) {
-                        SigBit bit = input_bits[i];
-                        if (!bit.is_wire())
-                                continue;
-
-                        int mask = 1 << i;
-                        bool depend = false;
-                        for (int idx = 0; idx < table_size; ++idx) {
-                                int cof_index = idx ^ mask;
-                                if (cof_index < 0 || cof_index >= table_size)
-                                        continue;
-                                if (table.at(idx) != table.at(cof_index)) {
-                                        depend = true;
-                                        break;
-                                }
-                        }
-
-                        if (depend)
-                                depend_inputs.insert(bit);
-                }
-        };
-
-        if (output_port_name == ID(Z5)) {
-                Const z5init = initval.extract(0, 32);
-                accumulate_depend_bits(z5init, 5);
-        } else if (output_port_name == ID(Z)) {
-                accumulate_depend_bits(initval, 6);
-        } else {
-                return false;
-        }
-
-        return true;
+	return IsAND(cell) || IsOR(cell) || IsNOT(cell) || IsMUX(cell) || IsXOR(cell) || IsGTP_LUT(cell) || IsGTP_LUT6D(cell);
 }
 
 
@@ -764,41 +652,11 @@ bool Bit2oCut(dict<SigBit, pool<SigBit>> &bit2cut)
                                 cuts[i] = bit2cut[outs[i]];
                         }
 
-                        auto convert_cut_to_pool = [](const pool<SigBit> &cut) {
-                                pool<SigBit> unique_bits;
-                                for (auto bit : cut)
-                                        if (bit.is_wire())
-                                                unique_bits.insert(bit);
-                                return unique_bits;
-                        };
-
                         auto is_cost_improving = [&](int ia, int ib, const pool<SigBit> &cut_a, const pool<SigBit> &cut_b, const pool<SigBit> &merged) {
-                                auto get_depend_inputs = [&](int idx, const pool<SigBit> &fallback_cut, bool &valid) {
-                                        pool<SigBit> depend_bits;
-                                        valid = CollectDependInputsForCost(outs[idx], depend_bits);
-                                        if (!valid)
-                                                depend_bits = convert_cut_to_pool(fallback_cut);
-                                        return depend_bits;
-                                };
-
-                                bool a_valid = false, b_valid = false;
-                                pool<SigBit> dep_a = get_depend_inputs(ia, cut_a, a_valid);
-                                pool<SigBit> dep_b = get_depend_inputs(ib, cut_b, b_valid);
-
-                                pool<SigBit> dep_merged = dep_a;
-                                dep_merged.insert(dep_b.begin(), dep_b.end());
-                                if (!a_valid || !b_valid) {
-                                        pool<SigBit> merged_fallback = convert_cut_to_pool(merged);
-                                        dep_merged.insert(merged_fallback.begin(), merged_fallback.end());
-                                }
-
-                                if (dep_merged.size() > 6)
-                                        return false;
-
                                 float level = std::max(bit2depth[outs[ia]], bit2depth[outs[ib]]);
                                 float level_term = (level / 20.0f) + 1.0f;
-                                int pin_before = dep_a.size() + dep_b.size();
-                                int pin_after = dep_merged.size();
+                                int pin_before = cut_a.size() + cut_b.size();
+                                int pin_after = merged.size();
                                 float cost_before = level_term * 2.0f * 10.0f + pin_before;
                                 float cost_after = level_term * 1.0f * 10.0f + pin_after;
                                 return cost_after + 1e-3f < cost_before;
@@ -3227,7 +3085,7 @@ RTLIL::Cell* addDualOutputLut(Module *module,
     if (!share_inputs)
         return nullptr;
 
-    auto add_cut_bits_unique = [&](const pool<SigBit> &cut) {
+     auto add_cut_bits_unique = [&](const pool<SigBit> &cut) {
         for (auto bit : cut) {
             if (!pin_index.count(bit)) {
                 pin_index[bit] = pins.size();
@@ -3277,6 +3135,51 @@ RTLIL::Cell* addDualOutputLut(Module *module,
         if (!z_uses_6_inputs || ((mask >> 5) & 1) == 0)
             init64[idx_base] = (val_z5 == State::S1);
     }
+
+    auto eval_from_init = [&](bool is_z, size_t mask) {
+        size_t idx_base = 0;
+        size_t o5_inputs = std::min<size_t>(5, input_count);
+        for (size_t i = 0; i < o5_inputs; ++i)
+            if ((mask >> i) & 1)
+                idx_base |= (1 << i);
+
+        if (!is_z)
+            return init64[idx_base];
+
+        if (!z_uses_6_inputs)
+            return init64[idx_base | (1 << 5)];
+
+        bool i5_val = (mask >> 5) & 1;
+        return init64[idx_base | (i5_val << 5)];
+    };
+
+    auto depends_on_pin = [&](bool is_z, size_t pin_idx) {
+        if (!is_z && pin_idx >= 5)
+            return false;
+
+        for (size_t mask = 0; mask < comb_limit; ++mask) {
+            if ((mask >> pin_idx) & 1)
+                continue;
+
+            size_t mask1 = mask | (1ull << pin_idx);
+            bool v0 = eval_from_init(is_z, mask);
+            bool v1 = eval_from_init(is_z, mask1);
+            if (v0 != v1)
+                return true;
+        }
+        return false;
+    };
+
+    size_t shared_dependencies = 0;
+    for (size_t idx = 0; idx < input_count; ++idx) {
+        bool z_dep = depends_on_pin(true, idx);
+        bool z5_dep = depends_on_pin(false, idx);
+        if (z_dep && z5_dep)
+            ++shared_dependencies;
+    }
+
+    if (shared_dependencies == 0)
+        return nullptr;
 
     Cell *drv = bit2driver[out_z];
     log_assert(drv);
@@ -3580,6 +3483,7 @@ struct SynthPangoPass : public ScriptPass {
 		if (check_label("pango")) {
 			run(stringf("hierarchy -check -top %s;;", top_module_name.c_str()));
 			run("synth");
+			run("wreduce");
 			MapperInit(module);
 			MapperMain(module);
 		}
