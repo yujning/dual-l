@@ -1,0 +1,31 @@
+[package]
+name = "eqmap"
+version = "0.8.0"
+edition = "2024"
+default-run = "eqmap_fpga"
+license = "Apache-2.0"
+
+[dependencies]
+bitvec = "1.0.1"
+clap = { version = "4.5.31", features = ["derive"] }
+egg = "0.10.0"
+indicatif = "0.17.11"
+serde = { version = "1.0.218", features = ["derive"] }
+serde_json = "1.0.140"
+sv-parser = "0.13.3"
+ctrlc = "3.4"
+safety-net = "0.2.10"
+
+[lints.clippy]
+manual_range_contains = "allow"
+
+[features]
+default = [ "dyn_decomp" ]
+# We probably don't want the compiler to apply folding on LUTs.
+# It is too expensive
+# default = [ "dyn_decomp", "egraph_fold" ]
+egraph_fold = []
+exactness = [ "egg/lp" ]
+cut_analysis = []
+dyn_decomp = [ "cut_analysis" ]
+graph_dumps = []

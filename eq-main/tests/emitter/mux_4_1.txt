@@ -1,0 +1,55 @@
+// RUN: emit-verilog --canonicalize %s | FileCheck %s
+
+// 4:1 mux
+(MUX s1 (MUX s0 a b) (MUX s0 c d))
+
+// CHECK: module mux_4_1 (
+// CHECK:     s1,
+// CHECK:     s0,
+// CHECK:     a,
+// CHECK:     b,
+// CHECK:     c,
+// CHECK:     d,
+// CHECK:     y
+// CHECK: );
+// CHECK:   input s1;
+// CHECK:   wire s1;
+// CHECK:   input s0;
+// CHECK:   wire s0;
+// CHECK:   input a;
+// CHECK:   wire a;
+// CHECK:   input b;
+// CHECK:   wire b;
+// CHECK:   input c;
+// CHECK:   wire c;
+// CHECK:   input d;
+// CHECK:   wire d;
+// CHECK:   output y;
+// CHECK:   wire y;
+// CHECK:   wire __0__;
+// CHECK:   wire __1__;
+// CHECK:   LUT3 #(
+// CHECK:       .INIT(8'hca)
+// CHECK:   ) __2__ (
+// CHECK:       .I0(b),
+// CHECK:       .I1(a),
+// CHECK:       .I2(s0),
+// CHECK:       .O(__0__)
+// CHECK:   );
+// CHECK:   LUT3 #(
+// CHECK:       .INIT(8'hca)
+// CHECK:   ) __3__ (
+// CHECK:       .I0(d),
+// CHECK:       .I1(c),
+// CHECK:       .I2(s0),
+// CHECK:       .O(__1__)
+// CHECK:   );
+// CHECK:   LUT3 #(
+// CHECK:       .INIT(8'hca)
+// CHECK:   ) __4__ (
+// CHECK:       .I0(__1__),
+// CHECK:       .I1(__0__),
+// CHECK:       .I2(s1),
+// CHECK:       .O(y)
+// CHECK:   );
+// CHECK: endmodule
