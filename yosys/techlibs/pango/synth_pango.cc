@@ -1,3 +1,4 @@
+
 /*
  *  yosys -- Yosys Open SYnthesis Suite
  *
@@ -732,46 +733,88 @@ bool Bit2oCut(dict<SigBit, pool<SigBit>> &bit2cut)
 bool GetBestCut(Cell *cell, pool<SigBit> &cut_selected)
 {
         cut_selected.clear();
-        // depth-oriented cut selection
-        const dict<pool<SigBit>, pool<Cell *>> &cuts = cell2cuts[cell];//取得cell所有cut组
+
+        const dict<pool<SigBit>, pool<Cell *>> &cuts = cell2cuts[cell];
         if (cuts.size() == 1) {
                 cut_selected = cuts.begin()->first;
                 return cut_selected.size() > 0;
         }
+
         log_assert(cuts.size() > 0);
 
-        const float depth_norm = 20.0f;
         const float depth_eps = 0.01f;
-        const float cost_eps = 0.01f;
+        const float cost_eps = 1e-3f;
+        const bool first_pass = (cur_interation == 0);
 
         float selected_depth = std::numeric_limits<float>::infinity();
         float selected_cost = std::numeric_limits<float>::infinity();
-        float best_fallback_cost = std::numeric_limits<float>::infinity();
-        pool<SigBit> best_fallback_cut;
+
+        float min_area_metric = std::numeric_limits<float>::infinity();
+        pool<SigBit> min_area_cut;
+
         SigBit outbit = GetCellOutput(cell);
+        float required_depth = std::numeric_limits<float>::infinity();
+        if (!first_pass && cell2OptDepth.count(cell)) {
+                required_depth = cell2OptDepth[cell] - bit2height[outbit];
+        }
 
         for (auto cutpair : cuts) {
-                pool<SigBit> cur_cut = cutpair.first;//取得cuts池中某一个cut的sigbit集合
+                const pool<SigBit> &cur_cut = cutpair.first;
                 if (cur_cut.empty())
                         continue;
 
                 float cur_depth = 0.0f;
-                float cur_area = 0.0f;
+                float cur_af = 0.0f;
+                float fanout_term = 0.0f;
+
                 for (auto &bit : cur_cut) {
                         cur_depth = max(bit2depth[bit], cur_depth);
-                        cur_area += bit2af[bit];
+                        cur_af += bit2af[bit];
+
+                        float fo_est = 1.0f;
+                        if (bit2fanout_est.count(bit)) {
+                                fo_est = bit2fanout_est[bit];
+                        } else if (bit2reader.count(bit)) {
+                                fo_est = bit2reader[bit].size();
+                        }
+                        fanout_term += 1.0f / max(1.0f, fo_est);
                 }
 
-                float est_luts = cur_area + 1.0f;
-                float depth_term = (cur_depth + 1.0f) / depth_norm + 1.0f;
-                float cur_cost = depth_term * est_luts * 10.0f + cur_cut.size();
-
-                if (cur_cost < best_fallback_cost) {
-                        best_fallback_cost = cur_cost;
-                        best_fallback_cut = cur_cut;
+                float area_metric = cur_af + cur_cut.size();
+                if (area_metric < min_area_metric) {
+                        min_area_metric = area_metric;
+                        min_area_cut = cur_cut;
                 }
 
-                if (0 == cur_interation) {//首次迭代优先深度
+                float slack = std::numeric_limits<float>::infinity();
+                if (std::isfinite(required_depth)) {
+                        slack = required_depth - cur_depth;
+                }
+
+                if (!first_pass && std::isfinite(slack) && slack < -depth_eps)
+                        continue;
+
+                const float depth_weight = first_pass ? 3.0f : 1.25f;
+                const float area_weight = first_pass ? 1.0f : 2.35f;
+                const float fanout_weight = 0.6f;
+                const float slack_penalty = 6.0f;
+                const float slack_bonus = 0.35f;
+
+                float slack_cost = 0.0f;
+                if (std::isfinite(slack)) {
+                        if (slack >= 0.0f) {
+                                slack_cost = -slack_bonus * std::min(slack, 2.0f);
+                        } else {
+                                slack_cost = slack_penalty * (-slack);
+                        }
+                }
+
+                float cur_cost = depth_weight * (cur_depth + 1.0f) +
+                                 area_weight * area_metric +
+                                 fanout_weight * fanout_term +
+                                 slack_cost;
+
+                if (first_pass) {
                         if (cur_depth + depth_eps < selected_depth) {
                                 cut_selected = cur_cut;
                                 selected_depth = cur_depth;
@@ -780,14 +823,11 @@ bool GetBestCut(Cell *cell, pool<SigBit> &cut_selected)
                                 cut_selected = cur_cut;
                                 selected_cost = cur_cost;
                         }
-                } else {//后续迭代优先面积（改为综合 cost）
-                        if (cur_depth > cell2OptDepth[cell] - bit2height[outbit]) {
-                                continue;
-                        }
+                } else {
                         if (cur_cost + cost_eps < selected_cost) {
                                 cut_selected = cur_cut;
-                                selected_depth = cur_depth;
                                 selected_cost = cur_cost;
+                                selected_depth = cur_depth;
                         } else if (fabs(cur_cost - selected_cost) <= cost_eps && cur_depth < selected_depth - depth_eps) {
                                 cut_selected = cur_cut;
                                 selected_depth = cur_depth;
@@ -795,10 +835,10 @@ bool GetBestCut(Cell *cell, pool<SigBit> &cut_selected)
                 }
         }
 
-        if (cut_selected.size() == 0) {
-                // choose best cost cut as fallback
-                cut_selected = best_fallback_cut;
+        if (cut_selected.empty()) {
+                cut_selected = min_area_cut;
         }
+
         return cut_selected.size() > 0;
 }
 float GetEstimatedFanout(SigBit bit)
@@ -812,39 +852,64 @@ float GetEstimatedFanout(SigBit bit)
 
 bool UpdateCutDepthAf(const pool<SigBit> &cut_selected, Cell *cell, SigBit outbit)
 {//面积全是0
-	float depth = 0;
-	float af = 0;
-	for (auto &bit : cut_selected) {
-		af += bit2af[bit];
-		depth = max(depth, bit2depth[bit]);
-	}
+        float depth = 0;
+        float af = 0;
+        for (auto &bit : cut_selected) {
+                af += bit2af[bit];
+                depth = max(depth, bit2depth[bit]);
+        }
 
-	float fanout_est = GetEstimatedFanout(outbit);
-	bit2depth[outbit] = depth + 1;
-	bit2af[outbit] = (af+cut_selected.size()) / fanout_est;
-	return true;
+        float fanout_est = max(1.0f, GetEstimatedFanout(outbit));
+        float updated_depth = depth + 1.0f;
+        if (bit2depth.count(outbit)) {
+                bit2depth[outbit] = max(bit2depth[outbit], updated_depth);
+        } else {
+                bit2depth[outbit] = updated_depth;
+        }
+
+        float raw_af = (af + cut_selected.size()) / fanout_est;
+        if (bit2af.count(outbit)) {
+                bit2af[outbit] = 0.6f * bit2af[outbit] + 0.4f * raw_af;
+        } else {
+                bit2af[outbit] = raw_af;
+        }
+        return true;
 }
 
 bool TraverseFWD(Module *module, const pool<SigBit> &prime_inputs, dict<SigBit, pool<SigBit>> &bit2cut)
 {
-	for (SigBit pi : prime_inputs) {
-		bit2depth[pi] = 0.0;
-		bit2af[pi] = 0.0;
-	}
+        for (SigBit pi : prime_inputs) {
+                bit2depth[pi] = 0.0;
+                bit2af[pi] = 0.0;
+                size_t fo_actual = 0;
+                if (bit2reader.count(pi)) {
+                        fo_actual = bit2reader[pi].size();
+                }
+                bit2fanout_est[pi] = std::max<size_t>(1, fo_actual);
+        }
 
-	vector<Cell *> gates;
-	GetTopoSortedGates(module, gates);
-	for (size_t i = 0; i < gates.size(); i++) {
-		pool<SigBit> cut_selected;
-		//此处对每个cell单独求解
-		if (!GetBestCut(gates[i], cut_selected)) {//取得每个cell的延迟最优情况下的面积最优cut
-			log_error(" not selected cut %s\n", gates[i]->name.c_str());
-		}
-		SigBit outbit = GetCellOutput(gates[i]);
-		bit2cut[outbit] = cut_selected;
-		UpdateCutDepthAf(cut_selected, gates[i], outbit);//对每个cell更新depth和af
-	}
-	return true;
+        vector<Cell *> gates;
+        GetTopoSortedGates(module, gates);
+        for (size_t i = 0; i < gates.size(); i++) {
+                pool<SigBit> cut_selected;
+                //此处对每个cell单独求解
+                if (!GetBestCut(gates[i], cut_selected)) {//取得每个cell的延迟最优情况下的面积最优cut
+                        log_error(" not selected cut %s\n", gates[i]->name.c_str());
+                }
+                SigBit outbit = GetCellOutput(gates[i]);
+                bit2cut[outbit] = cut_selected;
+                UpdateCutDepthAf(cut_selected, gates[i], outbit);//对每个cell更新depth和af
+
+                size_t fo_actual = 0;
+                if (bit2reader.count(outbit)) {
+                        fo_actual = bit2reader[outbit].size();
+                }
+                float prev_est = bit2fanout_est.count(outbit) ? bit2fanout_est[outbit] : std::max<size_t>(1, fo_actual);
+                float blended = 0.5f * prev_est + 0.5f * std::max<size_t>(1, fo_actual);
+                size_t fo_update = std::max<size_t>(1, static_cast<size_t>(std::lround(blended)));
+                bit2fanout_est[outbit] = fo_update;
+        }
+        return true;
 }
 bool TraverseBWD(Module *module, const pool<SigBit> &prime_outputs, dict<SigBit, pool<SigBit>> &bit2cut)
 {
@@ -897,23 +962,33 @@ bool TraverseBWD(Module *module, const pool<SigBit> &prime_outputs, dict<SigBit,
 		}
 	}
 
-	for (auto &pp : bit2fanout_est) {
-		SigBit bit = pp.first;
-		size_t fo = pp.second;
-		if (bit2fanout_bwd.count(bit)) {
-			bit2fanout_est[bit] = bit2fanout_bwd[bit];
-		} else {
-			bit2fanout_est[bit] = 0; // this bit is not in any cut, maybe is a internal bit
-		}
-		for (auto reader : bit2reader[bit]) {
-			bit2fanout_est[bit] += IsGTP(reader);
-		}
-	}
-	bit2cut.clear();
-	for (auto &p : map_result) {
-		bit2cut[p.first] = p.second;
-	}
-	return true;
+        pool<SigBit> fo_bits;
+        for (auto &pp : bit2fanout_est)
+                fo_bits.insert(pp.first);
+        for (auto &pp : bit2fanout_bwd)
+                fo_bits.insert(pp.first);
+
+        for (auto bit : fo_bits) {
+                size_t observed = 0;
+                if (bit2fanout_bwd.count(bit)) {
+                        observed = bit2fanout_bwd[bit];
+                }
+                if (bit2reader.count(bit)) {
+                        for (auto reader : bit2reader[bit]) {
+                                observed += IsGTP(reader);
+                        }
+                }
+                observed = std::max<size_t>(1, observed);
+
+                float prev = bit2fanout_est.count(bit) ? bit2fanout_est[bit] : observed;
+                float blended = 0.4f * prev + 0.6f * observed;
+                bit2fanout_est[bit] = std::max<size_t>(1, static_cast<size_t>(std::lround(blended)));
+        }
+        bit2cut.clear();
+        for (auto &p : map_result) {
+                bit2cut[p.first] = p.second;
+        }
+        return true;
 }
 /*
 specify port dirction of each cell for yosys_celltypes/modwalker to
