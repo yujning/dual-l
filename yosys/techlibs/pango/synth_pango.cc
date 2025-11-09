@@ -590,145 +590,226 @@ int SortCutLevel(const vector<Cell*> &cells_in_level,
                   vector<pair<Cell*, int>> &cell_pi_list)
 {
     cell_pi_list.clear();
-   int  num_six_input = 0;
-
-    vector<pair<Cell*, int>> six_list;
-    vector<pair<Cell*, int>> other_list;
 
     for (auto *cell : cells_in_level) {
         SigBit out = GetCellOutput(cell);
-        int pi_size = bit2cut[out].size();
-        if (pi_size == 6)
-            six_list.push_back({cell, pi_size});
-        else
-            other_list.push_back({cell, pi_size});
+        int pi_size = bit2cut.count(out) ? bit2cut[out].size() : 0;
+        cell_pi_list.push_back({cell, pi_size});
     }
 
-    // 6-input 的放前面
-    cell_pi_list.insert(cell_pi_list.end(), six_list.begin(), six_list.end());
-    cell_pi_list.insert(cell_pi_list.end(), other_list.begin(), other_list.end());
+    std::sort(cell_pi_list.begin(), cell_pi_list.end(),
+              [](const pair<Cell*, int> &a, const pair<Cell*, int> &b) {
+                  if (a.second != b.second)
+                      return a.second > b.second;
+                  return a.first->name < b.first->name;
+              });
 
-    num_six_input = six_list.size();
+    int num_six_input = 0;
+    for (auto &item : cell_pi_list) {
+        if (item.second == 6)
+            num_six_input++;
+        else
+            break;
+    }
+
     return num_six_input;
 }
-//补充：等价验证函数，对于6picut进行验证
 //枚举并按边存储可行性对
 //图算法求得最优组队并存入twoOutputCuts
 bool Bit2oCut(dict<SigBit, pool<SigBit>> &bit2cut)
 {
     log("Bit2oCut: entry, bit2cut size = %ld\n", bit2cut.size());
     twoOutputCuts.clear();
-    pool<SigBit> fused_outputs;
-    dict<int, vector<Cell*>> level2cells;
 
+    pool<SigBit> fused_outputs;
+
+    dict<int, vector<Cell*>> level2cells;
     for (auto &kv : bit2cut) {
         SigBit out = kv.first;
+        if (!bit2driver.count(out))
+            continue;
         Cell *cell = bit2driver[out];
-        int depth = bit2depth[out];
+        if (!cell)
+            continue;
+        int depth = static_cast<int>(bit2depth[out]);
         level2cells[depth].push_back(cell);
     }
 
-    for (auto &lv_pair : level2cells) {
-        int level = lv_pair.first;
-        auto &cells = lv_pair.second;
+    vector<int> levels;
+    for (auto &kv : level2cells)
+        levels.push_back(kv.first);
+    std::sort(levels.begin(), levels.end());
 
-        // ✅ 仅对当前层级的 cell 进行排序
+    struct LevelState {
+        vector<SigBit> outs;
+        vector<pool<SigBit>> cuts;
+        vector<int> pis;
+        vector<bool> fused_small;
+    };
+
+    dict<int, LevelState> level_states;
+
+    for (int level : levels) {
+        auto &cells = level2cells[level];
         vector<pair<Cell*, int>> cell_pi_list;
         int six_num = SortCutLevel(cells, bit2cut, cell_pi_list);
 
-			size_t n = cell_pi_list.size();
-			if (n == 0) continue;
-
-			// adjacency list: 无向图，节点为 cell_pi_list 的下标 [0..n-1]
-			vector<vector<int>> adj(n);
-
-			// 存每条边对应的合并 cut（如果后续需要重建 merged cut）
-			std::map<std::pair<int,int>, pool<SigBit>> edgeMergedCut;
-
-			// 为性能，提前把每个节点的 out 和 cut 提取到数组
-                        vector<SigBit> outs(n);
-                        vector<pool<SigBit>> cuts(n);
-                        for (size_t i = 0; i < n; ++i) {
-                                outs[i] = GetCellOutput(cell_pi_list[i].first);
-                                cuts[i] = bit2cut[outs[i]];
-                        }
-
-                        auto is_cost_improving = [&](int ia, int ib, const pool<SigBit> &cut_a, const pool<SigBit> &cut_b, const pool<SigBit> &merged) {
-                                float level = std::max(bit2depth[outs[ia]], bit2depth[outs[ib]]);
-                                float level_term = (level / 20.0f) + 1.0f;
-                                int pin_before = cut_a.size() + cut_b.size();
-                                int pin_after = merged.size();
-                                float cost_before = level_term * 2.0f * 10.0f + pin_before;
-                                float cost_after = level_term * 1.0f * 10.0f + pin_after;
-                                return cost_after + 1e-3f < cost_before;
-                        };
-
-			// 构建边 (遵循你对 6PI / 非6 的规则)
-			for (int i = 0; i < (int)n; ++i) {
-				if (i < six_num) {
-					// i 是 6PI：only try second cut j in non-6 区间 [six_num .. n-1]
-					for (int j = six_num; j < (int)n; ++j) {
-						if (i == j) continue;
-						// 注意：此处不检查 fused_outputs — 我们要记录所有可能的融合
-						const pool<SigBit> &cut1 = cuts[i];
-						const pool<SigBit> &cut2 = cuts[j];
-						if (cut2.size() == 6) continue; // second must be <6
-                                                if (!CheckCutEquiv(cut1, outs[i], cut2, outs[j])) continue;
-                                                pool<SigBit> merged = cut1;
-                                                if (!is_cost_improving(i, j, cut1, cut2, merged))
-                                                        continue;
-                                                // 可融合：记录无向边 i <-> j
-                                                adj[i].push_back(j);
-                                                adj[j].push_back(i);
-                                                // 存合并结果（你原来把 merged = cut1）
-                                                edgeMergedCut[{i, j}] = merged;
-                                        }
-                                } else {
-                                        // i 是非6：只在非6 区间内向后配对，避免重复对称检查
-                                        for (int j = i + 1; j < (int)n; ++j) {
-                                                // 都是非6（因为 j >= i+1 且 i >= six_num）
-                                                const pool<SigBit> &cut1 = cuts[i];
-                                                const pool<SigBit> &cut2 = cuts[j];
-                                                if (!HasCommonLeaf(cut1, cut2)) continue;
-                                                pool<SigBit> merged = cut1;
-                                                merged.insert(cut2.begin(), cut2.end());
-                                                if (merged.size() > 5) continue; // 超出输入数限制
-                                                if (!is_cost_improving(i, j, cut1, cut2, merged))
-                                                        continue;
-                                                // 可融合：记录无向边
-                                                adj[i].push_back(j);
-                                                adj[j].push_back(i);
-                                                // 存合并结果（注意键用有序 pair）
-                                                edgeMergedCut[{i, j}] = merged;
-					}
-				}
-			}
-				    // ---------- 求最大匹配 ----------
-    auto [mate, match_pairs] = max_matching(adj);
-    log("Level %d: find %d merge pairs (out of %zu cells)\n", level, match_pairs, n);
-
-    // ---------- 保存结果到 twoOutputCuts ----------
-    for (int i = 0; i < (int)n; ++i) {
-        int j = mate[i];
-        if (j == -1 || i > j) continue;
-
-        // 找对应的 merged cut
-        pool<SigBit> merged_cut;
-        auto key = (i < j) ? std::make_pair(i, j) : std::make_pair(j, i);
-        auto it = edgeMergedCut.find(key);
-        if (it != edgeMergedCut.end())
-            merged_cut = it->second;
-        else
+        size_t n = cell_pi_list.size();
+        if (n == 0)
             continue;
 
-        // 记录双输出cut（由上层统一处理）
-       twoOutputCuts[{outs[i], outs[j]}] = merged_cut;
+        vector<vector<int>> adj(n);
+        std::map<std::pair<int, int>, pool<SigBit>> edgeMergedCut;
+
+        LevelState state;
+        state.outs.resize(n);
+        state.cuts.resize(n);
+        state.pis.resize(n);
+        state.fused_small.assign(n, false);
+
+        for (size_t i = 0; i < n; ++i) {
+            state.outs[i] = GetCellOutput(cell_pi_list[i].first);
+            state.cuts[i] = bit2cut[state.outs[i]];
+            state.pis[i] = state.cuts[i].size();
+        }
+
+        auto record_edge = [&](int a, int b, const pool<SigBit> &merged_cut) {
+            if (a == b)
+                return;
+            if (fused_outputs.count(state.outs[a]) || fused_outputs.count(state.outs[b]))
+                return;
+            std::pair<int, int> key = (a < b) ? std::make_pair(a, b) : std::make_pair(b, a);
+            adj[a].push_back(b);
+            adj[b].push_back(a);
+            edgeMergedCut[key] = merged_cut;
+        };
+
+        for (int i = 0; i < (int)n; ++i) {
+            if (i < six_num) {
+                for (int j = six_num; j < (int)n; ++j) {
+                    if (state.pis[j] == 6)
+                        continue;
+                    if (!CheckCutEquiv(state.cuts[i], state.outs[i], state.cuts[j], state.outs[j]))
+                        continue;
+                    pool<SigBit> merged = state.cuts[i];
+                    for (auto bit : state.cuts[j])
+                        merged.insert(bit);
+                    if (merged.size() > 6)
+                        continue;
+                    record_edge(i, j, merged);
+                }
+            } else {
+                for (int j = i + 1; j < (int)n; ++j) {
+                    if (!HasCommonLeaf(state.cuts[i], state.cuts[j]))
+                        continue;
+                    pool<SigBit> merged = state.cuts[i];
+                    merged.insert(state.cuts[j].begin(), state.cuts[j].end());
+                    if (merged.size() > 6)
+                        continue;
+                    record_edge(i, j, merged);
+                }
+            }
+        }
+
+        auto [mate, match_pairs] = max_matching(adj);
+        log("Level %d: find %d merge pairs (out of %zu cells)\n", level, match_pairs, n);
+
+        for (int i = 0; i < (int)n; ++i) {
+            int j = mate[i];
+            if (j == -1 || i > j)
+                continue;
+            if (fused_outputs.count(state.outs[i]) || fused_outputs.count(state.outs[j]))
+                continue;
+
+            std::pair<int, int> key = (i < j) ? std::make_pair(i, j) : std::make_pair(j, i);
+            auto it = edgeMergedCut.find(key);
+            if (it == edgeMergedCut.end())
+                continue;
+
+            const pool<SigBit> &merged_cut = it->second;
+            if (merged_cut.empty())
+                continue;
+
+            twoOutputCuts[{state.outs[i], state.outs[j]}] = merged_cut;
+            fused_outputs.insert(state.outs[i]);
+            fused_outputs.insert(state.outs[j]);
+
+            if (state.pis[i] <= 4) {
+                state.fused_small[i] = true;
+            }
+            if (state.pis[j] <= 4) {
+                state.fused_small[j] = true;
+            }
+        }
+
+        level_states[level] = state;
+    }
+
+    for (int level : levels) {
+        auto &state = level_states[level];
+        size_t n = state.outs.size();
+        if (n == 0)
+            continue;
+
+        dict<SigBit, vector<int>> leaf_to_indices;
+
+        for (int i = 0; i < (int)n; ++i) {
+            if (state.pis[i] > 4)
+                continue;
+            if (state.fused_small[i])
+                continue;
+            if (fused_outputs.count(state.outs[i]))
+                continue;
+            for (auto bit : state.cuts[i])
+                leaf_to_indices[bit].push_back(i);
+        }
+
+        for (int i = 0; i < (int)n; ++i) {
+            if (state.pis[i] > 4)
+                continue;
+            if (state.fused_small[i])
+                continue;
+            if (fused_outputs.count(state.outs[i]))
+                continue;
+
+            bool merged_flag = false;
+            for (auto bit : state.cuts[i]) {
+                if (!leaf_to_indices.count(bit))
+                    continue;
+                for (int idx : leaf_to_indices[bit]) {
+                    if (idx == i)
+                        continue;
+                    if (idx < i)
+                        continue;
+                    if (state.pis[idx] > 4)
+                        continue;
+                    if (state.fused_small[idx])
+                        continue;
+                    if (fused_outputs.count(state.outs[idx]))
+                        continue;
+
+                    pool<SigBit> merged = state.cuts[i];
+                    merged.insert(state.cuts[idx].begin(), state.cuts[idx].end());
+                    if (merged.size() > 5)
+                        continue;
+
+                    twoOutputCuts[{state.outs[i], state.outs[idx]}] = merged;
+                    fused_outputs.insert(state.outs[i]);
+                    fused_outputs.insert(state.outs[idx]);
+                    state.fused_small[i] = true;
+                    state.fused_small[idx] = true;
+                    merged_flag = true;
+                    break;
+                }
+                if (merged_flag)
+                    break;
+            }
         }
     }
+
     log("Bit2oCut: exit, twoOutputCuts size = %ld\n", twoOutputCuts.size());
     return true;
 }
-
 
 bool GetBestCut(Cell *cell, pool<SigBit> &cut_selected)
 {
