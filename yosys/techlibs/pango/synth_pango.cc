@@ -83,99 +83,192 @@ bool Bit2oCut(dict<SigBit, pool<SigBit>> &bit2cut) ;//核心
 State StateEval(dict<SigBit, State> &bit_map, SigBit out);
 void check2ocut();
 
-
-
-//blossom_max_matching算法
-pair<vector<int>, int> max_matching(const vector<vector<int>>& g) {
+// Deterministic Edmonds' blossom (unweighted maximum matching).
+// - n: number of vertices (0..n-1)
+// - g: adjacency list (must be deterministic: neighbors sorted ascending, unique)
+// - match: output vector<int> of size n, match[v] = partner or -1
+// This implementation avoids any unordered containers or iteration over hash maps.
+void max_matching_blossom_deterministic(const vector<vector<int>> &g, vector<int> &match)
+{
     int n = (int)g.size();
-    vector<int> mate(n, -1), p(n), base(n);
-    vector<int> q;
+    match.assign(n, -1);
+
+    // helper arrays
+    vector<int> p(n), base(n), q(n);
     vector<char> used(n), blossom(n);
 
-    function<int(int,int)> lca = [&](int a, int b) {
-        vector<char> used_path(n, false);
+    auto lca = [&](int a, int b) {
+        vector<char> used_lca(n, 0);
         while (true) {
             a = base[a];
-            used_path[a] = true;
-            if (mate[a] == -1) break;
-            a = p[mate[a]];
+            used_lca[a] = 1;
+            if (match[a] == -1) break;
+            a = p[match[a]];
         }
         while (true) {
             b = base[b];
-            if (used_path[b]) return b;
-            b = p[mate[b]];
+            if (used_lca[b]) return b;
+            b = p[match[b]];
         }
     };
 
-    function<void(int,int,int)> mark_path = [&](int v, int b, int children) {
+    auto mark_path = [&](int v, int b, int x) {
         while (base[v] != b) {
-            blossom[base[v]] = blossom[base[mate[v]]] = true;
-            p[v] = children;
-            children = mate[v];
-            v = p[mate[v]];
+            blossom[base[v]] = blossom[base[match[v]]] = 1;
+            p[v] = x;
+            x = match[v];
+            v = p[match[v]];
         }
     };
 
-    function<int(int)> find_augmenting = [&](int root) -> int {
-        used.assign(n, false);
-        p.assign(n, -1);
-        for (int i = 0; i < n; ++i) base[i] = i;
-        q.clear();
-        q.push_back(root);
-        used[root] = true;
-        int qh = 0;
-        while (qh < (int)q.size()) {
+    auto find_path = [&](int root) -> bool {
+        fill(used.begin(), used.end(), 0);
+        fill(p.begin(), p.end(), -1);
+        iota(base.begin(), base.end(), 0);
+
+        int qh = 0, qt = 0;
+        q[qt++] = root;
+        used[root] = 1;
+
+        while (qh < qt) {
             int v = q[qh++];
-            for (int to : g[v]) {
-                if (base[v] == base[to] || mate[v] == to) continue;
-                if (to == root || (mate[to] != -1 && p[mate[to]] != -1)) {
-                    int curbase = lca(v, to);
-                    blossom.assign(n, false);
-                    mark_path(v, curbase, to);
-                    mark_path(to, curbase, v);
+
+            // iterate neighbors in ascending order (g is assumed sorted)
+            for (int u : g[v]) {
+                if (base[v] == base[u] || match[v] == u) continue;
+                if (u == root || (match[u] != -1 && p[match[u]] != -1)) {
+                    int curbase = lca(v, u);
+                    fill(blossom.begin(), blossom.end(), 0);
+                    mark_path(v, curbase, u);
+                    mark_path(u, curbase, v);
+                    // compress blossom: for all vertices, if blossom[base[i]] then rebase to curbase
                     for (int i = 0; i < n; ++i) {
                         if (blossom[base[i]]) {
                             base[i] = curbase;
                             if (!used[i]) {
-                                used[i] = true;
-                                q.push_back(i);
+                                used[i] = 1;
+                                q[qt++] = i;
                             }
                         }
                     }
-                } else if (p[to] == -1) {
-                    p[to] = v;
-                    if (mate[to] == -1)
-                        return to; // found augmenting path ending at 'to'
-                    to = mate[to];
-                    used[to] = true;
-                    q.push_back(to);
+                } else if (p[u] == -1) {
+                    p[u] = v;
+                    if (match[u] == -1) {
+                        // augmenting path found; augment along the path
+                        int cur = u;
+                        while (cur != -1) {
+                            int pv = p[cur];
+                            int nv = (pv == -1) ? -1 : match[pv];
+                            match[cur] = pv;
+                            if (pv != -1) match[pv] = cur;
+                            cur = nv;
+                        }
+                        return true;
+                    } else {
+                        // push the vertex matched with u
+                        int mv = match[u];
+                        if (!used[mv]) {
+                            used[mv] = 1;
+                            q[qt++] = mv;
+                        }
+                    }
                 }
-            }
-        }
-        return -1;
+            } // end for neighbors
+        } // end while queue
+        return false;
     };
 
     for (int v = 0; v < n; ++v) {
-        if (mate[v] == -1) {
-            int to = find_augmenting(v);
-            if (to == -1) continue;
-            // augment path ending at 'to'
-            int cur = to;
-            while (cur != -1) {
-                int pv = p[cur];
-                int ppv = (pv != -1 ? mate[pv] : -1);
-                mate[cur] = pv;
-                mate[pv] = cur;
-                cur = ppv;
-            }
+        if (match[v] == -1) {
+            find_path(v);
         }
     }
+}
 
-    int match_pairs = 0;
+// --- 无权一般图最大匹配 (Edmonds Blossom) ---
+void max_matching_blossom(int n, const vector<pair<int,int>> &edges, vector<int> &match) {
+    vector<vector<int>> g(n);
+    for (auto &e : edges) {
+        g[e.first].push_back(e.second);
+        g[e.second].push_back(e.first);
+    }
+
+    vector<int> p(n, -1), base(n), q(n);
+    vector<bool> used(n), blossom(n);
+
+    auto lca = [&](int a, int b) {
+        vector<bool> used2(n, false);
+        while (true) {
+            a = base[a];
+            used2[a] = true;
+            if (match[a] == -1) break;
+            a = p[match[a]];
+        }
+        while (true) {
+            b = base[b];
+            if (used2[b]) return b;
+            b = p[match[b]];
+        }
+    };
+
+    auto mark_path = [&](int v, int b, int x) {
+        while (base[v] != b) {
+            blossom[base[v]] = blossom[base[match[v]]] = true;
+            p[v] = x;
+            x = match[v];
+            v = p[match[v]];
+        }
+    };
+
+    auto bfs = [&](int start) {
+        fill(p.begin(), p.end(), -1);
+        iota(base.begin(), base.end(), 0);
+        fill(used.begin(), used.end(), false);
+        fill(q.begin(), q.end(), 0);
+        int qh = 0, qt = 0;
+        q[qt++] = start;
+        used[start] = true;
+
+        while (qh < qt) {
+            int v = q[qh++];
+            for (int u : g[v]) {
+                if (base[v] == base[u] || match[v] == u) continue;
+                if (u == start || (match[u] != -1 && p[match[u]] != -1)) {
+                    int b = lca(v, u);
+                    fill(blossom.begin(), blossom.end(), false);
+                    mark_path(v, b, u);
+                    mark_path(u, b, v);
+                    for (int i = 0; i < n; ++i)
+                        if (blossom[base[i]]) {
+                            base[i] = b;
+                            if (!used[i]) used[i] = true, q[qt++] = i;
+                        }
+                }
+                else if (p[u] == -1) {
+                    p[u] = v;
+                    if (match[u] == -1) {
+                        while (u != -1) {
+                            v = p[u];
+                            int w = match[v];
+                            match[v] = u;
+                            match[u] = v;
+                            u = w;
+                        }
+                        return true;
+                    }
+                    else {
+                        used[match[u]] = true;
+                        q[qt++] = match[u];
+                    }
+                }
+            }
+        }
+        return false;
+    };
+
+    fill(match.begin(), match.end(), -1);
     for (int i = 0; i < n; ++i)
-        if (mate[i] != -1 && i < mate[i]) ++match_pairs;
-
-    return {mate, match_pairs};
+        if (match[i] == -1) bfs(i);
 }
 
 
@@ -496,65 +589,53 @@ bool MapperInit(Module *module)
 //     }
 //     return false;
 // }
-
-bool HasCommonLeaf(const pool<SigBit> &cut1, const pool<SigBit> &cut2)
-{
-    // 选择较小和较大的集合
-    const pool<SigBit> &smaller = (cut1.size() <= cut2.size()) ? cut1 : cut2;
-    const pool<SigBit> &larger  = (cut1.size() <= cut2.size()) ? cut2 : cut1;
-
-    // 检查 smaller 是否完全包含在 larger 里
-    for (auto &sig : smaller) {
-        if (larger.count(sig)) {
-            return true; // 有一个包含
-        }
-    }
-    return false; 
-}
-
 bool CheckCutEquiv(const pool<SigBit>& cut1, SigBit out1,
                    const pool<SigBit>& cut2, SigBit out2)
 {
-    const pool<SigBit> *six_cut = nullptr;
-    const pool<SigBit> *five_cut = nullptr;
-    SigBit six_out, five_out;
+    const pool<SigBit> *larger_cut = nullptr;
+    const pool<SigBit> *smaller_cut = nullptr;
+    SigBit larger_out, smaller_out;
 
-    if (cut1.size() == 6 && cut2.size() == 5) {
-        six_cut = &cut1;
-        five_cut = &cut2;
-        six_out = out1;
-        five_out = out2;
-    } else if (cut2.size() == 6 && cut1.size() == 5) {
-six_cut = &cut2;
-five_cut = &cut1;
-        six_out = out2;
-        five_out = out1;
+    if (cut1.size() >= cut2.size()) {
+        larger_cut = &cut1;
+        larger_out = out1;
+        smaller_cut = &cut2;
+        smaller_out = out2;
     } else {
-        return false;
+        larger_cut = &cut2;
+        larger_out = out2;
+        smaller_cut = &cut1;
+        smaller_out = out1;
     }
 
-    std::vector<SigBit> five_inputs;
-    for (auto bit : *five_cut)
-        five_inputs.push_back(bit);
+    if (larger_cut->size() > 6)
+        return false;
 
+    if (smaller_cut->size() == 0 || smaller_cut->size() > larger_cut->size())
+        return false;
+
+    std::vector<SigBit> small_inputs;
+    small_inputs.reserve(smaller_cut->size());
     pool<SigBit> subset_bits;
-    for (auto &bit : five_inputs) {
+
+    for (auto bit : *smaller_cut) {
         if (subset_bits.count(bit))
             return false;
-subset_bits.insert(bit);
-        if (!six_cut->count(bit))
+        subset_bits.insert(bit);
+        if (!larger_cut->count(bit))
             return false;
+        small_inputs.push_back(bit);
     }
 
-    std::vector<SigBit> six_inputs;
-    six_inputs.reserve(6);
-    for (auto &bit : five_inputs)
-        six_inputs.push_back(bit);
-    for (auto bit : *six_cut)
-        if (!subset_bits.count(bit))
-            six_inputs.push_back(bit);
+    std::vector<SigBit> large_inputs = small_inputs;
+    for (auto bit : *larger_cut) {
+        if (!subset_bits.count(bit)) {
+            large_inputs.push_back(bit);
+            subset_bits.insert(bit);
+        }
+    }
 
-    if (six_inputs.size() != 6)
+    if (large_inputs.size() != larger_cut->size() || large_inputs.size() > 6)
         return false;
 
     auto eval_mask = [&](const std::vector<SigBit> &inputs, SigBit out, uint64_t &mask) -> bool {
@@ -574,20 +655,47 @@ subset_bits.insert(bit);
         return true;
     };
 
-		uint64_t mask6 = 0, mask5 = 0;
-		if (!eval_mask(six_inputs, six_out, mask6))  return false;
-		if (!eval_mask(five_inputs, five_out, mask5)) return false;
+    uint64_t mask_large = 0, mask_small = 0;
+    if (!eval_mask(large_inputs, larger_out, mask_large))
+        return false;
+    if (!eval_mask(small_inputs, smaller_out, mask_small))
+        return false;
 
-		uint32_t expected = static_cast<uint32_t>(mask5 & 0xFFFFFFFFull);
-		uint32_t plane0   = static_cast<uint32_t>( mask6        & 0xFFFFFFFFull);      // 第六输入=0
-		uint32_t plane1   = static_cast<uint32_t>((mask6 >> 32) & 0xFFFFFFFFull);      // 第六输入=1
+    size_t small_var = small_inputs.size();
+    size_t large_var = large_inputs.size();
+    size_t extra_bits = large_var - small_var;
 
-		 
+    size_t total_states_large = 1ull << large_var;
+    size_t total_states_small = 1ull << small_var;
 
-		return plane0 == expected || plane1 == expected;
+    size_t extra_states = 1ull << extra_bits;
+    size_t extra_shift = small_var;
+    size_t extra_mask = extra_bits ? ((1ull << extra_bits) - 1) : 0;
+    size_t small_mask = total_states_small - 1;
+    uint64_t expected_plane = mask_small;
+    if (total_states_small < 64)
+        expected_plane &= (1ull << total_states_small) - 1;
 
+    for (size_t assign = 0; assign < extra_states; ++assign) {
+        uint64_t plane = 0;
+        for (size_t idx = 0; idx < total_states_large; ++idx) {
+            if (extra_bits) {
+                size_t extra_val = (idx >> extra_shift) & extra_mask;
+                if (extra_val != assign)
+                    continue;
+            }
+
+            size_t small_idx = idx & small_mask;
+            if (mask_large & (1ull << idx))
+                plane |= (1ull << small_idx);
+        }
+
+        if (plane == expected_plane)
+            return true;
+    }
+
+    return false;
 }
-
 int SortCutLevel(const vector<Cell*> &cells_in_level,
                   dict<SigBit, pool<SigBit>> &bit2cut,
                   vector<pair<Cell*, int>> &cell_pi_list)
@@ -643,15 +751,15 @@ bool Bit2oCut(dict<SigBit, pool<SigBit>> &bit2cut)
         levels.push_back(kv.first);
     std::sort(levels.begin(), levels.end());
 
+    // ✅ 精简后的数据结构
     struct LevelState {
-        vector<SigBit> outs;
-        vector<pool<SigBit>> cuts;
-        vector<int> pis;
-        vector<bool> fused_small;
+        vector<SigBit> outs;            // 输出比特
+        vector<pool<SigBit>> cuts;      // 每个输出对应 CUT
     };
 
     dict<int, LevelState> level_states;
 
+    // --- 构建每层的 outs + cuts ---
     for (int level : levels) {
         auto &cells = level2cells[level];
         vector<pair<Cell*, int>> cell_pi_list;
@@ -661,158 +769,165 @@ bool Bit2oCut(dict<SigBit, pool<SigBit>> &bit2cut)
         if (n == 0)
             continue;
 
-        vector<vector<int>> adj(n);
-        std::map<std::pair<int, int>, pool<SigBit>> edgeMergedCut;
-
         LevelState state;
         state.outs.resize(n);
         state.cuts.resize(n);
-        state.pis.resize(n);
-        state.fused_small.assign(n, false);
 
         for (size_t i = 0; i < n; ++i) {
             state.outs[i] = GetCellOutput(cell_pi_list[i].first);
             state.cuts[i] = bit2cut[state.outs[i]];
-            state.pis[i] = state.cuts[i].size();
         }
 
-        auto record_edge = [&](int a, int b, const pool<SigBit> &merged_cut) {
-            if (a == b)
-                return;
-            if (fused_outputs.count(state.outs[a]) || fused_outputs.count(state.outs[b]))
-                return;
-            std::pair<int, int> key = (a < b) ? std::make_pair(a, b) : std::make_pair(b, a);
-            adj[a].push_back(b);
-            adj[b].push_back(a);
-            edgeMergedCut[key] = merged_cut;
-        };
-
+        // --- 保留你原始的 small-big 初步融合逻辑 ---
         for (int i = 0; i < (int)n; ++i) {
             if (i < six_num) {
                 for (int j = six_num; j < (int)n; ++j) {
-                    if (state.pis[j] == 6)
-                        continue;
-                    if (!CheckCutEquiv(state.cuts[i], state.outs[i], state.cuts[j], state.outs[j]))
-                        continue;
-                    pool<SigBit> merged = state.cuts[i];
-                    for (auto bit : state.cuts[j])
-                        merged.insert(bit);
-                    if (merged.size() > 6)
-                        continue;
-                    record_edge(i, j, merged);
-                }
-            } else {
-                for (int j = i + 1; j < (int)n; ++j) {
-                    if (!HasCommonLeaf(state.cuts[i], state.cuts[j]))
-                        continue;
+                    if (state.cuts[j].size() == 6) continue;
+                    if (fused_outputs.count(state.outs[i]) || fused_outputs.count(state.outs[j])) continue;
+                    if (!CheckCutEquiv(state.cuts[i], state.outs[i], state.cuts[j], state.outs[j])) continue;
+
                     pool<SigBit> merged = state.cuts[i];
                     merged.insert(state.cuts[j].begin(), state.cuts[j].end());
-                    if (merged.size() > 6)
-                        continue;
-                    record_edge(i, j, merged);
+                    if (merged.size() > 6) continue;
+
+                    twoOutputCuts[{state.outs[i], state.outs[j]}] = merged;
+                    fused_outputs.insert(state.outs[i]);
+                    fused_outputs.insert(state.outs[j]);
                 }
-            }
-        }
-
-        auto [mate, match_pairs] = max_matching(adj);
-        log("Level %d: find %d merge pairs (out of %zu cells)\n", level, match_pairs, n);
-
-        for (int i = 0; i < (int)n; ++i) {
-            int j = mate[i];
-            if (j == -1 || i > j)
-                continue;
-            if (fused_outputs.count(state.outs[i]) || fused_outputs.count(state.outs[j]))
-                continue;
-
-            std::pair<int, int> key = (i < j) ? std::make_pair(i, j) : std::make_pair(j, i);
-            auto it = edgeMergedCut.find(key);
-            if (it == edgeMergedCut.end())
-                continue;
-
-            const pool<SigBit> &merged_cut = it->second;
-            if (merged_cut.empty())
-                continue;
-
-            twoOutputCuts[{state.outs[i], state.outs[j]}] = merged_cut;
-            fused_outputs.insert(state.outs[i]);
-            fused_outputs.insert(state.outs[j]);
-
-            if (state.pis[i] <= 4) {
-                state.fused_small[i] = true;
-            }
-            if (state.pis[j] <= 4) {
-                state.fused_small[j] = true;
             }
         }
 
         level_states[level] = state;
     }
-
+       // --- Deterministic per-level global matching ---
     for (int level : levels) {
         auto &state = level_states[level];
-        size_t n = state.outs.size();
-        if (n == 0)
-            continue;
+        int n = (int)state.outs.size();
+        if (n == 0) continue;
 
-        dict<SigBit, vector<int>> leaf_to_indices;
-
-        for (int i = 0; i < (int)n; ++i) {
-            if (state.pis[i] > 4)
-                continue;
-            if (state.fused_small[i])
-                continue;
-            if (fused_outputs.count(state.outs[i]))
-                continue;
-            for (auto bit : state.cuts[i])
-                leaf_to_indices[bit].push_back(i);
+        // 1) create stable mapping arrays outs_st / cuts_st sorted by stable key of outs
+        std::vector<int> order(n);
+        std::iota(order.begin(), order.end(), 0);
+        std::sort(order.begin(), order.end(), [&](int a, int b) {
+            std::string sa = std::string(log_signal(state.outs[a]));
+            std::string sb = std::string(log_signal(state.outs[b]));
+            if (sa != sb) return sa < sb;
+            return a < b;
+        });
+        std::vector<SigBit> outs_st(n);
+        std::vector<pool<SigBit>> cuts_st(n);
+        for (int i = 0; i < n; ++i) {
+            outs_st[i] = state.outs[order[i]];
+            cuts_st[i] = state.cuts[order[i]];
         }
 
-        for (int i = 0; i < (int)n; ++i) {
-            if (state.pis[i] > 4)
-                continue;
-            if (state.fused_small[i])
-                continue;
-            if (fused_outputs.count(state.outs[i]))
-                continue;
+        // 2) build deterministic inverted index: leaf -> vector<int> (indices into outs_st/cuts_st)
+        dict<SigBit, std::vector<int>> leaf_to_indices;
+        for (int i = 0; i < n; ++i) {
+            if (cuts_st[i].size() > 5) continue;
+            if (fused_outputs.count(outs_st[i])) continue;
+            // gather bits, sort by stable key
+            std::vector<SigBit> bits;
+            bits.reserve(cuts_st[i].size());
+            for (auto b : cuts_st[i]) bits.push_back(b);
+            std::sort(bits.begin(), bits.end(), [&](const SigBit &a, const SigBit &b){
+                return std::string(log_signal(a)) < std::string(log_signal(b));
+            });
+            bits.erase(std::unique(bits.begin(), bits.end()), bits.end());
+            for (auto bit : bits) leaf_to_indices[bit].push_back(i);
+        }
 
-            bool merged_flag = false;
-            for (auto bit : state.cuts[i]) {
-                if (!leaf_to_indices.count(bit))
-                    continue;
-                for (int idx : leaf_to_indices[bit]) {
-                    if (idx == i)
-                        continue;
-                    if (idx < i)
-                        continue;
-                    if (state.pis[idx] > 4)
-                        continue;
-                    if (state.fused_small[idx])
-                        continue;
-                    if (fused_outputs.count(state.outs[idx]))
-                        continue;
+        // normalize each value list (sort + unique)
+        std::vector<SigBit> keys;
+        for (auto &kv : leaf_to_indices) keys.push_back(kv.first);
+        std::sort(keys.begin(), keys.end(), [&](const SigBit &a, const SigBit &b){
+            return std::string(log_signal(a)) < std::string(log_signal(b));
+        });
+        for (auto &k : keys) {
+            auto &v = leaf_to_indices[k];
+            std::sort(v.begin(), v.end());
+            v.erase(std::unique(v.begin(), v.end()), v.end());
+        }
 
-                    pool<SigBit> merged = state.cuts[i];
-                    merged.insert(state.cuts[idx].begin(), state.cuts[idx].end());
-                    if (merged.size() > 5)
-                        continue;
+        // 3) enumerate all candidate edges (i<j) deterministically and store merged cuts
+        std::vector<std::pair<int,int>> edges;
+        edges.reserve(1024);
+        std::map<std::pair<int,int>, pool<SigBit>> edgeMergedCut; // ordered map -> deterministic iteration
 
-                    twoOutputCuts[{state.outs[i], state.outs[idx]}] = merged;
-                    fused_outputs.insert(state.outs[i]);
-                    fused_outputs.insert(state.outs[idx]);
-                    state.fused_small[i] = true;
-                    state.fused_small[idx] = true;
-                    merged_flag = true;
-                    break;
+        for (int i = 0; i < n; ++i) {
+            if (cuts_st[i].size() > 5) continue;
+            if (fused_outputs.count(outs_st[i])) continue;
+
+            std::vector<SigBit> bits;
+            bits.reserve(cuts_st[i].size());
+            for (auto b : cuts_st[i]) bits.push_back(b);
+            std::sort(bits.begin(), bits.end(), [&](const SigBit &a, const SigBit &b){
+                return std::string(log_signal(a)) < std::string(log_signal(b));
+            });
+            bits.erase(std::unique(bits.begin(), bits.end()), bits.end());
+
+            for (auto bit : bits) {
+                auto it = leaf_to_indices.find(bit);
+                if (it == leaf_to_indices.end()) continue;
+                const auto &cand = it->second;
+                for (int j : cand) {
+                    if (j <= i) continue;
+                    if (cuts_st[j].size() > 5) continue;
+                    if (fused_outputs.count(outs_st[j])) continue;
+
+                    pool<SigBit> merged = cuts_st[i];
+                    for (auto b : cuts_st[j]) merged.insert(b);
+                    if (merged.size() > 6) continue;
+
+                    std::pair<int,int> key = std::make_pair(i, j);
+                    edges.emplace_back(key);
+                    edgeMergedCut[key] = merged;
                 }
-                if (merged_flag)
-                    break;
             }
         }
-    }
+
+        // 4) sort & unique edges to make them deterministic
+        std::sort(edges.begin(), edges.end(), [](const std::pair<int,int> &a, const std::pair<int,int> &b){
+            if (a.first != b.first) return a.first < b.first;
+            return a.second < b.second;
+        });
+        edges.erase(std::unique(edges.begin(), edges.end()), edges.end());
+
+        // 5) build adjacency list g (deterministic) from edges
+        std::vector<std::vector<int>> g(n);
+        for (auto &e : edges) {
+            int a = e.first, b = e.second;
+            g[a].push_back(b);
+            g[b].push_back(a);
+        }
+        for (int v = 0; v < n; ++v) {
+            std::sort(g[v].begin(), g[v].end());
+            g[v].erase(std::unique(g[v].begin(), g[v].end()), g[v].end());
+        }
+
+        // 6) deterministic matching
+        std::vector<int> mate;
+        max_matching_blossom_deterministic(g, mate);
+
+        // 7) apply matches: write twoOutputCuts using outs_st mapping
+        for (int i = 0; i < n; ++i) {
+            int j = mate[i];
+            if (j == -1 || i > j) continue;
+            auto key = std::make_pair(i, j);
+            auto it = edgeMergedCut.find(key);
+            if (it == edgeMergedCut.end()) continue;
+            const pool<SigBit> &merged = it->second;
+            // write using original SigBit values outs_st[i], outs_st[j]
+            twoOutputCuts[{outs_st[i], outs_st[j]}] = merged;
+            fused_outputs.insert(outs_st[i]);
+            fused_outputs.insert(outs_st[j]);
+        }
+    } // end per-level
 
     log("Bit2oCut: exit, twoOutputCuts size = %ld\n", twoOutputCuts.size());
     return true;
 }
+
 
 bool GetBestCut(Cell *cell, pool<SigBit> &cut_selected)
 {
