@@ -3459,26 +3459,27 @@ RTLIL::Cell *addLut(Module *module, const pool<SigBit> &cut, const RTLIL::SigBit
 	vector<bool> cut_init_bools = GetCutInit(vcut, sig_z);
 	Cell *drv = bit2driver[sig_z];
 	log_assert(drv);
-	IdString name = drv->name;
-	string new_name = string(name.c_str()) + "_lut";
-	Cell *cell = nullptr;
-	if (using_internel_lut_type) {
-		// instantiate $lut, need call techmap pass
-		cell = module->addCell(IdString(new_name), ID($lut));
-		cell->parameters[ID::WIDTH] = RTLIL::Const(vcut.size());
-		cell->parameters[ID::LUT] = RTLIL::Const(cut_init_bools);
+        IdString name = drv->name;
+        string new_name = string(name.c_str()) + "_lut";
+        IdString unique_name = module->uniquify(RTLIL::IdString(new_name));
+        Cell *cell = nullptr;
+        if (using_internel_lut_type) {
+                // instantiate $lut, need call techmap pass
+                cell = module->addCell(unique_name, ID($lut));
+                cell->parameters[ID::WIDTH] = RTLIL::Const(vcut.size());
+                cell->parameters[ID::LUT] = RTLIL::Const(cut_init_bools);
 
-		cell->setPort(ID(A), vcut);
-		cell->setPort(ID(Y), sig_z);
-		cell->set_src_attribute(drv->get_src_attribute());
-	} else {
-		IdString types[] = {ID(GTP_LUT1), ID(GTP_LUT2), ID(GTP_LUT3), ID(GTP_LUT4), ID(GTP_LUT5), ID(GTP_LUT6)};
-		cell = module->addCell(RTLIL::IdString(new_name), types[vcut.size() - 1]);
-		cell->parameters[ID::INIT] = RTLIL::Const(cut_init_bools);
-		for (size_t i = 0; i < vcut.size(); ++i) {
-			string pin_name = "\\I" + to_string(i);
-			cell->setPort(RTLIL::IdString(pin_name), vcut[i]);
-		}
+                cell->setPort(ID(A), vcut);
+                cell->setPort(ID(Y), sig_z);
+                cell->set_src_attribute(drv->get_src_attribute());
+        } else {
+                IdString types[] = {ID(GTP_LUT1), ID(GTP_LUT2), ID(GTP_LUT3), ID(GTP_LUT4), ID(GTP_LUT5), ID(GTP_LUT6)};
+                cell = module->addCell(unique_name, types[vcut.size() - 1]);
+                cell->parameters[ID::INIT] = RTLIL::Const(cut_init_bools);
+                for (size_t i = 0; i < vcut.size(); ++i) {
+                        string pin_name = "\\I" + to_string(i);
+                        cell->setPort(RTLIL::IdString(pin_name), vcut[i]);
+                }
 		cell->setPort(ID(Z), sig_z);
 		cell->set_src_attribute(drv->get_src_attribute());
 	}
@@ -3634,8 +3635,8 @@ RTLIL::Cell* addDualOutputLut(Module *module,
     log_assert(drv);
     IdString drv_name = drv->name;
     std::string new_name = std::string(drv_name.c_str()) + "_lut6d";
-    Cell *cell = module->addCell(RTLIL::IdString(new_name), ID(GTP_LUT6D));
-
+    IdString unique_name = module->uniquify(RTLIL::IdString(new_name));
+    Cell *cell = module->addCell(unique_name, ID(GTP_LUT6D));
     for (size_t i = 0; i < input_count && i < 6; ++i) {
         std::string pin_name = "\\I" + std::to_string(i);
         cell->setPort(RTLIL::IdString(pin_name), pins[i]);
