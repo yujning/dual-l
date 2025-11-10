@@ -574,15 +574,18 @@ subset_bits.insert(bit);
         return true;
     };
 
-    uint64_t mask6 = 0, mask5 = 0;
-    if (!eval_mask(six_inputs, six_out, mask6))
-        return false;
-    if (!eval_mask(five_inputs, five_out, mask5))
-        return false;
+		uint64_t mask6 = 0, mask5 = 0;
+		if (!eval_mask(six_inputs, six_out, mask6))  return false;
+		if (!eval_mask(five_inputs, five_out, mask5)) return false;
 
- uint32_t plane0 = static_cast<uint32_t>(mask6 & 0xFFFFFFFFFFull); 
-    uint32_t expected = static_cast<uint32_t>(mask5 & 0xFFFFFFFFull);
-    return plane0 == expected;
+		uint32_t expected = static_cast<uint32_t>(mask5 & 0xFFFFFFFFull);
+		uint32_t plane0   = static_cast<uint32_t>( mask6        & 0xFFFFFFFFull);      // 第六输入=0
+		uint32_t plane1   = static_cast<uint32_t>((mask6 >> 32) & 0xFFFFFFFFull);      // 第六输入=1
+
+		 
+
+		return plane0 == expected || plane1 == expected;
+
 }
 
 int SortCutLevel(const vector<Cell*> &cells_in_level,
