@@ -799,130 +799,130 @@ bool Bit2oCut(dict<SigBit, pool<SigBit>> &bit2cut)
 
         level_states[level] = state;
     }
-    //    // --- Deterministic per-level global matching ---
-    // for (int level : levels) {
-    //     auto &state = level_states[level];
-    //     int n = (int)state.outs.size();
-    //     if (n == 0) continue;
+       // --- Deterministic per-level global matching ---
+    for (int level : levels) {
+        auto &state = level_states[level];
+        int n = (int)state.outs.size();
+        if (n == 0) continue;
 
-    //     // 1) create stable mapping arrays outs_st / cuts_st sorted by stable key of outs
-    //     std::vector<int> order(n);
-    //     std::iota(order.begin(), order.end(), 0);
-    //     std::sort(order.begin(), order.end(), [&](int a, int b) {
-    //         std::string sa = std::string(log_signal(state.outs[a]));
-    //         std::string sb = std::string(log_signal(state.outs[b]));
-    //         if (sa != sb) return sa < sb;
-    //         return a < b;
-    //     });
-    //     std::vector<SigBit> outs_st(n);
-    //     std::vector<pool<SigBit>> cuts_st(n);
-    //     for (int i = 0; i < n; ++i) {
-    //         outs_st[i] = state.outs[order[i]];
-    //         cuts_st[i] = state.cuts[order[i]];
-    //     }
+        // 1) create stable mapping arrays outs_st / cuts_st sorted by stable key of outs
+        std::vector<int> order(n);
+        std::iota(order.begin(), order.end(), 0);
+        std::sort(order.begin(), order.end(), [&](int a, int b) {
+            std::string sa = std::string(log_signal(state.outs[a]));
+            std::string sb = std::string(log_signal(state.outs[b]));
+            if (sa != sb) return sa < sb;
+            return a < b;
+        });
+        std::vector<SigBit> outs_st(n);
+        std::vector<pool<SigBit>> cuts_st(n);
+        for (int i = 0; i < n; ++i) {
+            outs_st[i] = state.outs[order[i]];
+            cuts_st[i] = state.cuts[order[i]];
+        }
 
-    //     // 2) build deterministic inverted index: leaf -> vector<int> (indices into outs_st/cuts_st)
-    //     dict<SigBit, std::vector<int>> leaf_to_indices;
-    //     for (int i = 0; i < n; ++i) {
-    //         if (cuts_st[i].size() > 5) continue;
-    //         if (fused_outputs.count(outs_st[i])) continue;
-    //         // gather bits, sort by stable key
-    //         std::vector<SigBit> bits;
-    //         bits.reserve(cuts_st[i].size());
-    //         for (auto b : cuts_st[i]) bits.push_back(b);
-    //         std::sort(bits.begin(), bits.end(), [&](const SigBit &a, const SigBit &b){
-    //             return std::string(log_signal(a)) < std::string(log_signal(b));
-    //         });
-    //         bits.erase(std::unique(bits.begin(), bits.end()), bits.end());
-    //         for (auto bit : bits) leaf_to_indices[bit].push_back(i);
-    //     }
+        // 2) build deterministic inverted index: leaf -> vector<int> (indices into outs_st/cuts_st)
+        dict<SigBit, std::vector<int>> leaf_to_indices;
+        for (int i = 0; i < n; ++i) {
+            if (cuts_st[i].size() > 5) continue;
+            if (fused_outputs.count(outs_st[i])) continue;
+            // gather bits, sort by stable key
+            std::vector<SigBit> bits;
+            bits.reserve(cuts_st[i].size());
+            for (auto b : cuts_st[i]) bits.push_back(b);
+            std::sort(bits.begin(), bits.end(), [&](const SigBit &a, const SigBit &b){
+                return std::string(log_signal(a)) < std::string(log_signal(b));
+            });
+            bits.erase(std::unique(bits.begin(), bits.end()), bits.end());
+            for (auto bit : bits) leaf_to_indices[bit].push_back(i);
+        }
 
-    //     // normalize each value list (sort + unique)
-    //     std::vector<SigBit> keys;
-    //     for (auto &kv : leaf_to_indices) keys.push_back(kv.first);
-    //     std::sort(keys.begin(), keys.end(), [&](const SigBit &a, const SigBit &b){
-    //         return std::string(log_signal(a)) < std::string(log_signal(b));
-    //     });
-    //     for (auto &k : keys) {
-    //         auto &v = leaf_to_indices[k];
-    //         std::sort(v.begin(), v.end());
-    //         v.erase(std::unique(v.begin(), v.end()), v.end());
-    //     }
+        // normalize each value list (sort + unique)
+        std::vector<SigBit> keys;
+        for (auto &kv : leaf_to_indices) keys.push_back(kv.first);
+        std::sort(keys.begin(), keys.end(), [&](const SigBit &a, const SigBit &b){
+            return std::string(log_signal(a)) < std::string(log_signal(b));
+        });
+        for (auto &k : keys) {
+            auto &v = leaf_to_indices[k];
+            std::sort(v.begin(), v.end());
+            v.erase(std::unique(v.begin(), v.end()), v.end());
+        }
 
-    //     // 3) enumerate all candidate edges (i<j) deterministically and store merged cuts
-    //     std::vector<std::pair<int,int>> edges;
-    //     edges.reserve(1024);
-    //     std::map<std::pair<int,int>, pool<SigBit>> edgeMergedCut; // ordered map -> deterministic iteration
+        // 3) enumerate all candidate edges (i<j) deterministically and store merged cuts
+        std::vector<std::pair<int,int>> edges;
+        edges.reserve(1024);
+        std::map<std::pair<int,int>, pool<SigBit>> edgeMergedCut; // ordered map -> deterministic iteration
 
-    //     for (int i = 0; i < n; ++i) {
-    //         if (cuts_st[i].size() > 5) continue;
-    //         if (fused_outputs.count(outs_st[i])) continue;
+        for (int i = 0; i < n; ++i) {
+            if (cuts_st[i].size() > 5) continue;
+            if (fused_outputs.count(outs_st[i])) continue;
 
-    //         std::vector<SigBit> bits;
-    //         bits.reserve(cuts_st[i].size());
-    //         for (auto b : cuts_st[i]) bits.push_back(b);
-    //         std::sort(bits.begin(), bits.end(), [&](const SigBit &a, const SigBit &b){
-    //             return std::string(log_signal(a)) < std::string(log_signal(b));
-    //         });
-    //         bits.erase(std::unique(bits.begin(), bits.end()), bits.end());
+            std::vector<SigBit> bits;
+            bits.reserve(cuts_st[i].size());
+            for (auto b : cuts_st[i]) bits.push_back(b);
+            std::sort(bits.begin(), bits.end(), [&](const SigBit &a, const SigBit &b){
+                return std::string(log_signal(a)) < std::string(log_signal(b));
+            });
+            bits.erase(std::unique(bits.begin(), bits.end()), bits.end());
 
-    //         for (auto bit : bits) {
-    //             auto it = leaf_to_indices.find(bit);
-    //             if (it == leaf_to_indices.end()) continue;
-    //             const auto &cand = it->second;
-    //             for (int j : cand) {
-    //                 if (j <= i) continue;
-    //                 if (cuts_st[j].size() > 5) continue;
-    //                 if (fused_outputs.count(outs_st[j])) continue;
+            for (auto bit : bits) {
+                auto it = leaf_to_indices.find(bit);
+                if (it == leaf_to_indices.end()) continue;
+                const auto &cand = it->second;
+                for (int j : cand) {
+                    if (j <= i) continue;
+                    if (cuts_st[j].size() > 5) continue;
+                    if (fused_outputs.count(outs_st[j])) continue;
 
-    //                 pool<SigBit> merged = cuts_st[i];
-    //                 for (auto b : cuts_st[j]) merged.insert(b);
-    //                 if (merged.size() > 6) continue;
+                    pool<SigBit> merged = cuts_st[i];
+                    for (auto b : cuts_st[j]) merged.insert(b);
+                    if (merged.size() > 6) continue;
 
-    //                 std::pair<int,int> key = std::make_pair(i, j);
-    //                 edges.emplace_back(key);
-    //                 edgeMergedCut[key] = merged;
-    //             }
-    //         }
-    //     }
+                    std::pair<int,int> key = std::make_pair(i, j);
+                    edges.emplace_back(key);
+                    edgeMergedCut[key] = merged;
+                }
+            }
+        }
 
-    //     // 4) sort & unique edges to make them deterministic
-    //     std::sort(edges.begin(), edges.end(), [](const std::pair<int,int> &a, const std::pair<int,int> &b){
-    //         if (a.first != b.first) return a.first < b.first;
-    //         return a.second < b.second;
-    //     });
-    //     edges.erase(std::unique(edges.begin(), edges.end()), edges.end());
+        // 4) sort & unique edges to make them deterministic
+        std::sort(edges.begin(), edges.end(), [](const std::pair<int,int> &a, const std::pair<int,int> &b){
+            if (a.first != b.first) return a.first < b.first;
+            return a.second < b.second;
+        });
+        edges.erase(std::unique(edges.begin(), edges.end()), edges.end());
 
-    //     // 5) build adjacency list g (deterministic) from edges
-    //     std::vector<std::vector<int>> g(n);
-    //     for (auto &e : edges) {
-    //         int a = e.first, b = e.second;
-    //         g[a].push_back(b);
-    //         g[b].push_back(a);
-    //     }
-    //     for (int v = 0; v < n; ++v) {
-    //         std::sort(g[v].begin(), g[v].end());
-    //         g[v].erase(std::unique(g[v].begin(), g[v].end()), g[v].end());
-    //     }
+        // 5) build adjacency list g (deterministic) from edges
+        std::vector<std::vector<int>> g(n);
+        for (auto &e : edges) {
+            int a = e.first, b = e.second;
+            g[a].push_back(b);
+            g[b].push_back(a);
+        }
+        for (int v = 0; v < n; ++v) {
+            std::sort(g[v].begin(), g[v].end());
+            g[v].erase(std::unique(g[v].begin(), g[v].end()), g[v].end());
+        }
 
-    //     // 6) deterministic matching
-    //     std::vector<int> mate;
-    //     max_matching_blossom_deterministic(g, mate);
+        // 6) deterministic matching
+        std::vector<int> mate;
+        max_matching_blossom_deterministic(g, mate);
 
-    //     // 7) apply matches: write twoOutputCuts using outs_st mapping
-    //     for (int i = 0; i < n; ++i) {
-    //         int j = mate[i];
-    //         if (j == -1 || i > j) continue;
-    //         auto key = std::make_pair(i, j);
-    //         auto it = edgeMergedCut.find(key);
-    //         if (it == edgeMergedCut.end()) continue;
-    //         const pool<SigBit> &merged = it->second;
-    //         // write using original SigBit values outs_st[i], outs_st[j]
-    //         twoOutputCuts[{outs_st[i], outs_st[j]}] = merged;
-    //         fused_outputs.insert(outs_st[i]);
-    //         fused_outputs.insert(outs_st[j]);
-    //     }
-    // } // end per-level
+        // 7) apply matches: write twoOutputCuts using outs_st mapping
+        for (int i = 0; i < n; ++i) {
+            int j = mate[i];
+            if (j == -1 || i > j) continue;
+            auto key = std::make_pair(i, j);
+            auto it = edgeMergedCut.find(key);
+            if (it == edgeMergedCut.end()) continue;
+            const pool<SigBit> &merged = it->second;
+            // write using original SigBit values outs_st[i], outs_st[j]
+            twoOutputCuts[{outs_st[i], outs_st[j]}] = merged;
+            fused_outputs.insert(outs_st[i]);
+            fused_outputs.insert(outs_st[j]);
+        }
+    } // end per-level
 
     log("Bit2oCut: exit, twoOutputCuts size = %ld\n", twoOutputCuts.size());
     return true;
@@ -3773,3 +3773,4 @@ struct SynthPangoPass : public ScriptPass {
 	}
 } SynthPangoPass;
 PRIVATE_NAMESPACE_END
+
