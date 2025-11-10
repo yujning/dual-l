@@ -82,6 +82,8 @@ pool<Cell *> GetReaders(Cell *cell, RTLIL::IdString port = RTLIL::IdString());
 bool Bit2oCut(dict<SigBit, pool<SigBit>> &bit2cut) ;//核心
 State StateEval(dict<SigBit, State> &bit_map, SigBit out);
 void check2ocut();
+dict<SigBit, pool<Cell *>> bit2fanouts;
+
 
 // Deterministic Edmonds' blossom (unweighted maximum matching).
 // - n: number of vertices (0..n-1)
@@ -923,6 +925,179 @@ bool Bit2oCut(dict<SigBit, pool<SigBit>> &bit2cut)
             fused_outputs.insert(outs_st[j]);
         }
     } // end per-level
+    
+	    // --- 跨层 cut 输入扩展 + 二次融合 ---
+    int max_level = 0;
+    for (auto &kv : bit2depth)
+        if (kv.second > max_level)
+            max_level = kv.second;
+
+    for (int level = 1; level <= max_level; ++level)
+    {
+        for (auto &kv : bit2cut)
+        {
+            SigBit cut_root = kv.first;
+            pool<SigBit> &cutC = kv.second;
+
+            if (fused_outputs.count(cut_root)) continue; // 已融合跳过
+            if (cutC.size() > 4) continue;
+
+            // 查找 cutC 的 root 节点的输入（fanin）
+            if (!bit2driver.count(cut_root)) continue;
+            Cell *cellC = bit2driver[cut_root];
+            if (!cellC) continue;
+
+            std::vector<SigBit> fanins;
+            for (auto p : cellC->connections()) {
+                if (cellC->input(p.first))
+                    for (auto b : p.second)
+                        fanins.push_back(b);
+            }
+
+            // cutC 所有节点集合（方便判断内部节点）
+            pool<SigBit> cutC_nodes = cutC;
+
+            // 遍历每个 fanin 的 fanout 节点
+            for (auto node_in : fanins)
+            {
+                if (!bit2fanouts.count(node_in)) continue;
+                for (auto target_node : bit2fanouts[node_in])
+                {
+                    // 找 target node 的输出 bit
+                    SigBit target_out = GetCellOutput(target_node);
+                    if (!bit2cut.count(target_out)) continue;
+
+                    pool<SigBit> newcut = bit2cut[target_out];
+                    if (newcut.size() > 4) continue;
+                    if (fused_outputs.count(target_out)) continue;
+
+                    // 检查 newcut 的输入是否包含 cutC 内部节点
+                    int inner_count = 0;
+                    for (auto b : newcut)
+                        if (cutC_nodes.count(b))
+                            inner_count++;
+
+                    // 计算 newcut 的非 cutC 内部节点数量
+                    int outer_ci = (int)newcut.size() - inner_count;
+                    int total_ci = outer_ci + (int)cutC.size();
+                    if (total_ci > 5) continue; // 超过 5 输入不融合
+
+                    // --- 构建扩展 newcut ---
+                    pool<SigBit> newcut2 = newcut;
+                    for (auto b : cutC_nodes)
+                        if (!newcut2.count(b))
+                            newcut2.insert(b);
+
+                    // newcut2 不能包含 cutC 外的节点
+                    for (auto it = newcut2.begin(); it != newcut2.end();) {
+                        if (!cutC_nodes.count(*it) && !cutC.count(*it))
+                            it = newcut2.erase(it);
+                        else
+                            ++it;
+                    }
+
+                    // --- 融合 newcut2 和 cutC ---
+                    pool<SigBit> merged = newcut2;
+                    merged.insert(cutC.begin(), cutC.end());
+                    if (merged.size() > 6) continue;
+
+                    twoOutputCuts[{cut_root, target_out}] = merged;
+                    fused_outputs.insert(cut_root);
+                    fused_outputs.insert(target_out);
+                }
+            }
+        }
+    }
+	    for (int level : levels) {
+        if (level < 1)
+            continue;
+
+        auto it_state = level_states.find(level);
+        if (it_state == level_states.end())
+            continue;
+
+        auto &state = it_state->second;
+        int n = static_cast<int>(state.outs.size());
+        for (int idx = 0; idx < n; ++idx) {
+            SigBit cut_out = state.outs[idx];
+            if (fused_outputs.count(cut_out))
+                continue;
+
+            if (!bit2driver.count(cut_out))
+                continue;
+
+            pool<SigBit> &cut_c = state.cuts[idx];
+            if (cut_c.size() > 4)
+                continue;
+
+            Cell *root_cell = bit2driver[cut_out];
+            if (root_cell == nullptr)
+                continue;
+
+            vector<SigBit> fanins;
+            GetCellInputsVector(root_cell, fanins);
+
+            for (auto fanin_bit : fanins) {
+                if (!bit2reader.count(fanin_bit))
+                    continue;
+
+                auto &targets = bit2reader[fanin_bit];
+                for (Cell *target_cell : targets) {
+                    if (target_cell == nullptr)
+                        continue;
+                    if (target_cell == root_cell)
+                        continue;
+                    if (!cell2bits.count(target_cell))
+                        continue;
+
+                    SigBit target_out = GetCellOutput(target_cell);
+                    if (target_out == cut_out)
+                        continue;
+                    if (!bit2cut.count(target_out))
+                        continue;
+                    if (fused_outputs.count(target_out))
+                        continue;
+
+                    pool<SigBit> &new_cut = bit2cut[target_out];
+                    if (new_cut.size() > 4)
+                        continue;
+
+                    size_t external_cnt = 0;
+                    for (auto bit : new_cut) {
+                        if (!cut_c.count(bit))
+                            ++external_cnt;
+                    }
+
+                    if (external_cnt + cut_c.size() > 5)
+                        continue;
+
+                    pool<SigBit> new_cut2;
+                    for (auto bit : new_cut) {
+                        if (!cut_c.count(bit))
+                            new_cut2.insert(bit);
+                    }
+                    for (auto bit : cut_c)
+                        new_cut2.insert(bit);
+
+                    if (new_cut2.size() > 6)
+                        continue;
+
+                    std::string out_a = std::string(log_signal(cut_out));
+                    std::string out_b = std::string(log_signal(target_out));
+                    std::pair<SigBit, SigBit> key;
+                    if (out_a < out_b)
+                        key = {cut_out, target_out};
+                    else
+                        key = {target_out, cut_out};
+
+                    twoOutputCuts[key] = new_cut2;
+                    fused_outputs.insert(cut_out);
+                    fused_outputs.insert(target_out);
+                }
+            }
+        }
+    }
+
 
     log("Bit2oCut: exit, twoOutputCuts size = %ld\n", twoOutputCuts.size());
     return true;
@@ -3773,4 +3948,3 @@ struct SynthPangoPass : public ScriptPass {
 	}
 } SynthPangoPass;
 PRIVATE_NAMESPACE_END
-
