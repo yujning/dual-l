@@ -36,8 +36,6 @@ Implement of "Heuristics for Area Minimization in LUT-Based FPGA Technology Mapp
 #include <cmath>
 #include <limits>
 #include <bits/stdc++.h>
-#include <unordered_map>
-#include <unordered_set>
 USING_YOSYS_NAMESPACE
 using namespace std;
 PRIVATE_NAMESPACE_BEGIN
@@ -62,8 +60,6 @@ dict<SigBit, float> bit2height;
 dict<SigBit, float> bit2depth;
 dict<SigBit, float> bit2af;
 dict<SigBit, size_t> bit2fanout_est;
-
-dict<SigBit, pool<SigBit>> best_cone;
 dict<std::pair<SigBit,SigBit>,pool<SigBit>> twoOutputCuts;
 dict<Cell *, dict<pool<SigBit>, pool<Cell *>>> cell2cuts; // cell -> dict<cut, cone>
 bool using_internel_lut_type = false;
@@ -86,6 +82,8 @@ pool<Cell *> GetReaders(Cell *cell, RTLIL::IdString port = RTLIL::IdString());
 bool Bit2oCut(dict<SigBit, pool<SigBit>> &bit2cut) ;//核心
 State StateEval(dict<SigBit, State> &bit_map, SigBit out);
 void check2ocut();
+dict<SigBit, pool<Cell *>> bit2fanouts;
+
 
 // Deterministic Edmonds' blossom (unweighted maximum matching).
 // - n: number of vertices (0..n-1)
@@ -500,7 +498,6 @@ void GetTopoSortedGates(Module *module, vector<Cell *> &gates)
 	}
 }
 
-
 bool MapperMain(Module *module)
 {
         CheckCellWidth(module);//初始化映射信息
@@ -565,6 +562,7 @@ bool MapperMain(Module *module)
         return true;
 }
 
+// -----------------------
 bool MapperInit(Module *module)
 {
         log_debug("Pango init\n");
@@ -587,7 +585,12 @@ bool MapperInit(Module *module)
 
         return true;
 }
-
+// bool HasCommonLeaf(const pool<SigBit> &cut1, const pool<SigBit> &cut2) {
+//     for (auto &sig : cut1) {
+//         if (cut2.count(sig)) return true;
+//     }
+//     return false;
+// }
 bool CheckCutEquiv(const pool<SigBit>& cut1, SigBit out1,
                    const pool<SigBit>& cut2, SigBit out2)
 {
@@ -695,7 +698,6 @@ bool CheckCutEquiv(const pool<SigBit>& cut1, SigBit out1,
 
     return false;
 }
-
 int SortCutLevel(const vector<Cell*> &cells_in_level,
                   dict<SigBit, pool<SigBit>> &bit2cut,
                   vector<pair<Cell*, int>> &cell_pi_list)
@@ -725,126 +727,6 @@ int SortCutLevel(const vector<Cell*> &cells_in_level,
 
     return num_six_input;
 }
-// start: 起始 SigBit（Tcut 中的某个 leaf，可能是内部节点输出）
-// bcut: 目标 cut 的 leaf 集合（被扩展到的 cut）
-// Cnodes: CutA (Cout) 的内部 cell 集合（由 ConeFromBestCut 得到）
-// bit2driver: 全局驱动映射
-// reach_set: 输出参数，收集所有通过不越界路径到达 bcut 的 leaf
-// 返回：如果存在至少一个不越界路径到达 bcut leaf，则返回 true（并填写 reach_set），否则 false。
-vector<SigBit> collect_reachable_bcut_inputs_from( SigBit leaf,const pool<SigBit> &bcut, const pool<Cell*> &Cnodes)
-{
-    pool<SigBit> visited;
-    std::stack<SigBit> st;
-	vector<SigBit> newleaf;
-	st.push(leaf);
-    while (!st.empty()) {
-        SigBit cur = st.top(); st.pop();
-        if (visited.count(cur)) continue;
-        visited.insert(cur);
-
-        // 边界1：如果 cur 自身已在 bcut 中 -> 成功
-        if (bcut.count(cur)) {
-            newleaf.push_back(cur);
-            continue; // 继续看其他路径，收集更多可能的 bcut leaf
-        }
-
-        // 若 cur 没有驱动，视为越界（PI / 网络边界），该路径无效
-        if (!bit2driver.count(cur))
-            continue;
-
-        Cell* drv = bit2driver[cur];
-
-        // 边界2：若驱动节点不在 Cnodes 中 -> 越界，终止该路径（不返回 false，全局仍可能有其它成功路径）
-        if (!Cnodes.count(drv))
-            continue;
-
-        // 继续向上：把 drv 的所有输入推入栈
-        vector<SigBit> fins;
-        GetCellInputsVector(drv, fins);
-        for (auto f : fins) st.push(f);
-    }
-
-    // 如果找到了至少一个 bcut leaf，返回 true
-    return newleaf;
-}
-// // ---------- Helpers for localized cut-cone building and DFS mapping ----------
-
-// Build cone internal cell set for a given root and its cut (stop at leaf signals in `cut`).
-// Returns pool<Cell*> containing internal cone cells (includes the root's driver cell).
-static pool<Cell*> build_cone_cells(SigBit root, const pool<SigBit> &cut)
-{
-    pool<Cell*> Cnodes;
-    std::stack<Cell*> st;
-
-    auto it_root = bit2driver.find(root);
-    if (it_root == bit2driver.end()) return Cnodes;
-    Cell *root_cell = it_root->second;
-    st.push(root_cell);
-
-    while (!st.empty()) {
-        Cell *c = st.top(); st.pop();
-        if (Cnodes.count(c)) continue;
-        Cnodes.insert(c);
-
-        // push drivers of c's inputs unless they are cut leaves (stop at cut boundary)
-        vector<SigBit> fins;
-        GetCellInputsVector(c, fins);
-        for (auto fin : fins) {
-            // if fin is a cut leaf, do not go beyond
-            if (cut.count(fin)) continue;
-            auto it = bit2driver.find(fin);
-            if (it == bit2driver.end()) continue;
-            Cell *drv = it->second;
-            if (!Cnodes.count(drv)) st.push(drv);
-        }
-    }
-    return Cnodes;
-}
-
-pool<SigBit> ConeFromBestCut(SigBit root)
-{
-    pool<SigBit> cone_bits;
-    std::queue<SigBit> q;
-
-    // 根信号本身一定属于其 cone
-    cone_bits.insert(root);
-    q.push(root);
-
-    const pool<SigBit> &cut = best_bit2cut.at(root);
-
-    while (!q.empty())
-    {
-        SigBit cur = q.front();
-        q.pop();
-
-        // 如果当前是 cut 边界，则停止继续向上
-        if (cut.count(cur))
-            continue;
-
-        // 向上找驱动它的 cell
-        if (!bit2driver.count(cur))
-            continue;  // PI 或模块边界，停止该路径
-        Cell *drv = bit2driver[cur];
-        if (!drv)
-            continue;
-
-        // 将 drv 的所有输入加入 BFS
-        vector<SigBit> inputs;
-        GetCellInputsVector(drv, inputs);
-        for (auto &inb : inputs)
-        {
-            // 若尚未加入 cone，则加入并继续向上
-            if (!cone_bits.count(inb))
-            {
-                cone_bits.insert(inb);
-                q.push(inb);
-            }
-        }
-    }
-
-    return cone_bits;
-}
-
 //枚举并按边存储可行性对
 //图算法求得最优组队并存入twoOutputCuts
 bool Bit2oCut(dict<SigBit, pool<SigBit>> &bit2cut)
@@ -859,10 +741,6 @@ bool Bit2oCut(dict<SigBit, pool<SigBit>> &bit2cut)
         SigBit out = kv.first;
         if (!bit2driver.count(out))
             continue;
-		if(kv.second.size() <=4){
-			auto cone=	ConeFromBestCut(out);
-			best_cone[out]=cone;
-		}
         Cell *cell = bit2driver[out];
         if (!cell)
             continue;
@@ -1047,79 +925,179 @@ bool Bit2oCut(dict<SigBit, pool<SigBit>> &bit2cut)
             fused_outputs.insert(outs_st[j]);
         }
     } // end per-level
+    
+	    // --- 跨层 cut 输入扩展 + 二次融合 ---
+    int max_level = 0;
+    for (auto &kv : bit2depth)
+        if (kv.second > max_level)
+            max_level = kv.second;
 
-for (int level : levels) {
-        const auto &state = level_states.at(level);
-        int n = state.outs.size();
-        if (n == 0) continue;
+    for (int level = 1; level <= max_level; ++level)
+    {
+        for (auto &kv : bit2cut)
+        {
+            SigBit cut_root = kv.first;
+            pool<SigBit> &cutC = kv.second;
 
-        log("Level %d: checking %d cuts...\n", level, n);
+            if (fused_outputs.count(cut_root)) continue; // 已融合跳过
+            if (cutC.size() > 4) continue;
 
-        for (int i = 0; i < n; i++) {
-            SigBit rootA = state.outs[i];
-			if(state.cuts[i].size()>4) continue;
-            if (!best_bit2cut.count(rootA)) continue;
-            const auto &cutA = best_bit2cut.at(rootA);
+            // 查找 cutC 的 root 节点的输入（fanin）
+            if (!bit2driver.count(cut_root)) continue;
+            Cell *cellC = bit2driver[cut_root];
+            if (!cellC) continue;
 
-            for (int j = 0; j < n; j++) {
-                if (i == j) continue;
-                SigBit rootB = state.outs[j];
-				if(state.cuts[i].size()>4) continue;
-                if (!best_cone.count(rootB)) continue;
-                const auto &coneB = best_cone.at(rootB);
+            std::vector<SigBit> fanins;
+            for (auto p : cellC->connections()) {
+                if (cellC->input(p.first))
+                    for (auto b : p.second)
+                        fanins.push_back(b);
+            }
 
-                // 查 leaf ∈ cone
-                vector<SigBit> common_leaf;
-                for (auto leaf : cutA)
-                    if (coneB.count(leaf))
-                        common_leaf.push_back(leaf);
+            // cutC 所有节点集合（方便判断内部节点）
+            pool<SigBit> cutC_nodes = cutC;
 
-                if (!common_leaf.empty()) {
+            // 遍历每个 fanin 的 fanout 节点
+            for (auto node_in : fanins)
+            {
+                if (!bit2fanouts.count(node_in)) continue;
+                for (auto target_node : bit2fanouts[node_in])
+                {
+                    // 找 target node 的输出 bit
+                    SigBit target_out = GetCellOutput(target_node);
+                    if (!bit2cut.count(target_out)) continue;
 
-                    // --- 输出 rootA & its leafs
-                    log(" rootA = %s  (cut)\n", log_signal(rootA));
-                    log("   leafA (%d):", (int)cutA.size());
-                    for (auto leaf : cutA)
-                        log("     %s", log_signal(leaf));
+                    pool<SigBit> newcut = bit2cut[target_out];
+                    if (newcut.size() > 4) continue;
+                    if (fused_outputs.count(target_out)) continue;
 
-                    // --- 输出 rootB & its cone nodes
-log(" rootB = %s  (cone)\n", log_signal(rootB));
+                    // 检查 newcut 的输入是否包含 cutC 内部节点
+                    int inner_count = 0;
+                    for (auto b : newcut)
+                        if (cutC_nodes.count(b))
+                            inner_count++;
 
-/* --- 打印 cutB 的 leaf 集合 --- */
-if (!best_bit2cut.count(rootB)) {
-    log("   [ERROR] best_bit2cut missing rootB = %s\n", log_signal(rootB));
-} else {
-    const pool<SigBit> &cutB = best_bit2cut.at(rootB);
-    log("   leafB (%d):\n", (int)cutB.size());
-    for (auto l : cutB)
-        log("      %s\n", log_signal(l));
-}
+                    // 计算 newcut 的非 cutC 内部节点数量
+                    int outer_ci = (int)newcut.size() - inner_count;
+                    int total_ci = outer_ci + (int)cutC.size();
+                    if (total_ci > 5) continue; // 超过 5 输入不融合
 
-/* --- 打印 coneB 中对应的内部 cell 信息 --- */
-log("   coneB internal cells:\n");
-for (auto b : coneB) {
-    auto it = bit2driver.find(b);
-    if (it == bit2driver.end() || !it->second)
-        continue; // b 是 leaf 或 PI → 忽略
+                    // --- 构建扩展 newcut ---
+                    pool<SigBit> newcut2 = newcut;
+                    for (auto b : cutC_nodes)
+                        if (!newcut2.count(b))
+                            newcut2.insert(b);
 
-    Cell *cell = it->second;
-    log("      %s (%s)", log_id(cell->name), log_id(cell->type));
+                    // newcut2 不能包含 cutC 外的节点
+                    for (auto it = newcut2.begin(); it != newcut2.end();) {
+                        if (!cutC_nodes.count(*it) && !cutC.count(*it))
+                            it = newcut2.erase(it);
+                        else
+                            ++it;
+                    }
 
-}
+                    // --- 融合 newcut2 和 cutC ---
+                    pool<SigBit> merged = newcut2;
+                    merged.insert(cutC.begin(), cutC.end());
+                    if (merged.size() > 6) continue;
 
-
-                    // --- 公共 leaf
-                    log(" Common leaf(s) (%d):", (int)common_leaf.size());
-                    for (auto leaf : common_leaf)
-                        log("     %s", log_signal(leaf));
-
-                    // --- cut大小信息
-                    log(" \ncutA size = %d", (int)cutA.size());
-                    log(" cutB leaf size = %d\n", (int)best_bit2cut.at(rootB).size());
+                    twoOutputCuts[{cut_root, target_out}] = merged;
+                    fused_outputs.insert(cut_root);
+                    fused_outputs.insert(target_out);
                 }
             }
         }
     }
+	    for (int level : levels) {
+        if (level < 1)
+            continue;
+
+        auto it_state = level_states.find(level);
+        if (it_state == level_states.end())
+            continue;
+
+        auto &state = it_state->second;
+        int n = static_cast<int>(state.outs.size());
+        for (int idx = 0; idx < n; ++idx) {
+            SigBit cut_out = state.outs[idx];
+            if (fused_outputs.count(cut_out))
+                continue;
+
+            if (!bit2driver.count(cut_out))
+                continue;
+
+            pool<SigBit> &cut_c = state.cuts[idx];
+            if (cut_c.size() > 4)
+                continue;
+
+            Cell *root_cell = bit2driver[cut_out];
+            if (root_cell == nullptr)
+                continue;
+
+            vector<SigBit> fanins;
+            GetCellInputsVector(root_cell, fanins);
+
+            for (auto fanin_bit : fanins) {
+                if (!bit2reader.count(fanin_bit))
+                    continue;
+
+                auto &targets = bit2reader[fanin_bit];
+                for (Cell *target_cell : targets) {
+                    if (target_cell == nullptr)
+                        continue;
+                    if (target_cell == root_cell)
+                        continue;
+                    if (!cell2bits.count(target_cell))
+                        continue;
+
+                    SigBit target_out = GetCellOutput(target_cell);
+                    if (target_out == cut_out)
+                        continue;
+                    if (!bit2cut.count(target_out))
+                        continue;
+                    if (fused_outputs.count(target_out))
+                        continue;
+
+                    pool<SigBit> &new_cut = bit2cut[target_out];
+                    if (new_cut.size() > 4)
+                        continue;
+
+                    size_t external_cnt = 0;
+                    for (auto bit : new_cut) {
+                        if (!cut_c.count(bit))
+                            ++external_cnt;
+                    }
+
+                    if (external_cnt + cut_c.size() > 5)
+                        continue;
+
+                    pool<SigBit> new_cut2;
+                    for (auto bit : new_cut) {
+                        if (!cut_c.count(bit))
+                            new_cut2.insert(bit);
+                    }
+                    for (auto bit : cut_c)
+                        new_cut2.insert(bit);
+
+                    if (new_cut2.size() > 6)
+                        continue;
+
+                    std::string out_a = std::string(log_signal(cut_out));
+                    std::string out_b = std::string(log_signal(target_out));
+                    std::pair<SigBit, SigBit> key;
+                    if (out_a < out_b)
+                        key = {cut_out, target_out};
+                    else
+                        key = {target_out, cut_out};
+
+                    twoOutputCuts[key] = new_cut2;
+                    fused_outputs.insert(cut_out);
+                    fused_outputs.insert(target_out);
+                }
+            }
+        }
+    }
+
 
     log("Bit2oCut: exit, twoOutputCuts size = %ld\n", twoOutputCuts.size());
     return true;
@@ -3481,26 +3459,27 @@ RTLIL::Cell *addLut(Module *module, const pool<SigBit> &cut, const RTLIL::SigBit
 	vector<bool> cut_init_bools = GetCutInit(vcut, sig_z);
 	Cell *drv = bit2driver[sig_z];
 	log_assert(drv);
-	IdString name = drv->name;
-	string new_name = string(name.c_str()) + "_lut";
-	Cell *cell = nullptr;
-	if (using_internel_lut_type) {
-		// instantiate $lut, need call techmap pass
-		cell = module->addCell(IdString(new_name), ID($lut));
-		cell->parameters[ID::WIDTH] = RTLIL::Const(vcut.size());
-		cell->parameters[ID::LUT] = RTLIL::Const(cut_init_bools);
+        IdString name = drv->name;
+        string new_name = string(name.c_str()) + "_lut";
+        IdString unique_name = module->uniquify(RTLIL::IdString(new_name));
+        Cell *cell = nullptr;
+        if (using_internel_lut_type) {
+                // instantiate $lut, need call techmap pass
+                cell = module->addCell(unique_name, ID($lut));
+                cell->parameters[ID::WIDTH] = RTLIL::Const(vcut.size());
+                cell->parameters[ID::LUT] = RTLIL::Const(cut_init_bools);
 
-		cell->setPort(ID(A), vcut);
-		cell->setPort(ID(Y), sig_z);
-		cell->set_src_attribute(drv->get_src_attribute());
-	} else {
-		IdString types[] = {ID(GTP_LUT1), ID(GTP_LUT2), ID(GTP_LUT3), ID(GTP_LUT4), ID(GTP_LUT5), ID(GTP_LUT6)};
-		cell = module->addCell(RTLIL::IdString(new_name), types[vcut.size() - 1]);
-		cell->parameters[ID::INIT] = RTLIL::Const(cut_init_bools);
-		for (size_t i = 0; i < vcut.size(); ++i) {
-			string pin_name = "\\I" + to_string(i);
-			cell->setPort(RTLIL::IdString(pin_name), vcut[i]);
-		}
+                cell->setPort(ID(A), vcut);
+                cell->setPort(ID(Y), sig_z);
+                cell->set_src_attribute(drv->get_src_attribute());
+        } else {
+                IdString types[] = {ID(GTP_LUT1), ID(GTP_LUT2), ID(GTP_LUT3), ID(GTP_LUT4), ID(GTP_LUT5), ID(GTP_LUT6)};
+                cell = module->addCell(unique_name, types[vcut.size() - 1]);
+                cell->parameters[ID::INIT] = RTLIL::Const(cut_init_bools);
+                for (size_t i = 0; i < vcut.size(); ++i) {
+                        string pin_name = "\\I" + to_string(i);
+                        cell->setPort(RTLIL::IdString(pin_name), vcut[i]);
+                }
 		cell->setPort(ID(Z), sig_z);
 		cell->set_src_attribute(drv->get_src_attribute());
 	}
@@ -3656,8 +3635,8 @@ RTLIL::Cell* addDualOutputLut(Module *module,
     log_assert(drv);
     IdString drv_name = drv->name;
     std::string new_name = std::string(drv_name.c_str()) + "_lut6d";
-    Cell *cell = module->addCell(RTLIL::IdString(new_name), ID(GTP_LUT6D));
-
+    IdString unique_name = module->uniquify(RTLIL::IdString(new_name));
+    Cell *cell = module->addCell(unique_name, ID(GTP_LUT6D));
     for (size_t i = 0; i < input_count && i < 6; ++i) {
         std::string pin_name = "\\I" + std::to_string(i);
         cell->setPort(RTLIL::IdString(pin_name), pins[i]);
