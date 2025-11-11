@@ -62,6 +62,8 @@ dict<SigBit, float> bit2height;
 dict<SigBit, float> bit2depth;
 dict<SigBit, float> bit2af;
 dict<SigBit, size_t> bit2fanout_est;
+
+dict<SigBit, pool<SigBit>> best_cone;
 dict<std::pair<SigBit,SigBit>,pool<SigBit>> twoOutputCuts;
 dict<Cell *, dict<pool<SigBit>, pool<Cell *>>> cell2cuts; // cell -> dict<cut, cone>
 bool using_internel_lut_type = false;
@@ -497,45 +499,6 @@ void GetTopoSortedGates(Module *module, vector<Cell *> &gates)
 		}
 	}
 }
-pool<Cell*> ConeFromBestCut(SigBit root)
-{
-    pool<Cell*> cone;
-    std::queue<Cell*> q;
-
-    Cell *root_cell = bit2driver[root];
-    if (!root_cell) return cone;
-
-    q.push(root_cell);
-
-    const pool<SigBit> &cut = best_bit2cut.at(root);
-
-    while (!q.empty())
-    {
-        Cell* u = q.front();
-        q.pop();
-
-        // insert 返回 pair<iterator, bool>，bool = 是否首次插入
-        auto ret = cone.insert(u);
-        if (!ret.second) // 已经访问过
-            continue;
-
-        vector<SigBit> inputs;
-        GetCellInputsVector(u, inputs);
-
-        for (SigBit b : inputs)
-        {
-            // leaf = 边界，停止向上扩展
-            if (cut.count(b))
-                continue;
-
-            Cell *drv = bit2driver[b];
-            if (drv)
-                q.push(drv);
-        }
-    }
-
-    return cone;
-}
 
 
 bool MapperMain(Module *module)
@@ -602,7 +565,6 @@ bool MapperMain(Module *module)
         return true;
 }
 
-// -----------------------
 bool MapperInit(Module *module)
 {
         log_debug("Pango init\n");
@@ -625,55 +587,54 @@ bool MapperInit(Module *module)
 
         return true;
 }
-// bool HasCommonLeaf(const pool<SigBit> &cut1, const pool<SigBit> &cut2) {
-//     for (auto &sig : cut1) {
-//         if (cut2.count(sig)) return true;
-//     }
-//     return false;
-// }
+
 bool CheckCutEquiv(const pool<SigBit>& cut1, SigBit out1,
                    const pool<SigBit>& cut2, SigBit out2)
 {
-    const pool<SigBit> *six_cut = nullptr;
-    const pool<SigBit> *five_cut = nullptr;
-    SigBit six_out, five_out;
+    const pool<SigBit> *larger_cut = nullptr;
+    const pool<SigBit> *smaller_cut = nullptr;
+    SigBit larger_out, smaller_out;
 
-    if (cut1.size() == 6 && cut2.size() == 5) {
-        six_cut = &cut1;
-        five_cut = &cut2;
-        six_out = out1;
-        five_out = out2;
-    } else if (cut2.size() == 6 && cut1.size() == 5) {
-six_cut = &cut2;
-five_cut = &cut1;
-        six_out = out2;
-        five_out = out1;
+    if (cut1.size() >= cut2.size()) {
+        larger_cut = &cut1;
+        larger_out = out1;
+        smaller_cut = &cut2;
+        smaller_out = out2;
     } else {
-        return false;
+        larger_cut = &cut2;
+        larger_out = out2;
+        smaller_cut = &cut1;
+        smaller_out = out1;
     }
 
-    std::vector<SigBit> five_inputs;
-    for (auto bit : *five_cut)
-        five_inputs.push_back(bit);
+    if (larger_cut->size() > 6)
+        return false;
 
+    if (smaller_cut->size() == 0 || smaller_cut->size() > larger_cut->size())
+        return false;
+
+    std::vector<SigBit> small_inputs;
+    small_inputs.reserve(smaller_cut->size());
     pool<SigBit> subset_bits;
-    for (auto &bit : five_inputs) {
+
+    for (auto bit : *smaller_cut) {
         if (subset_bits.count(bit))
             return false;
-subset_bits.insert(bit);
-        if (!six_cut->count(bit))
+        subset_bits.insert(bit);
+        if (!larger_cut->count(bit))
             return false;
+        small_inputs.push_back(bit);
     }
 
-    std::vector<SigBit> six_inputs;
-    six_inputs.reserve(6);
-    for (auto &bit : five_inputs)
-        six_inputs.push_back(bit);
-    for (auto bit : *six_cut)
-        if (!subset_bits.count(bit))
-            six_inputs.push_back(bit);
+    std::vector<SigBit> large_inputs = small_inputs;
+    for (auto bit : *larger_cut) {
+        if (!subset_bits.count(bit)) {
+            large_inputs.push_back(bit);
+            subset_bits.insert(bit);
+        }
+    }
 
-    if (six_inputs.size() != 6)
+    if (large_inputs.size() != larger_cut->size() || large_inputs.size() > 6)
         return false;
 
     auto eval_mask = [&](const std::vector<SigBit> &inputs, SigBit out, uint64_t &mask) -> bool {
@@ -693,15 +654,46 @@ subset_bits.insert(bit);
         return true;
     };
 
-    uint64_t mask6 = 0, mask5 = 0;
-    if (!eval_mask(six_inputs, six_out, mask6))
+    uint64_t mask_large = 0, mask_small = 0;
+    if (!eval_mask(large_inputs, larger_out, mask_large))
         return false;
-    if (!eval_mask(five_inputs, five_out, mask5))
+    if (!eval_mask(small_inputs, smaller_out, mask_small))
         return false;
 
- uint32_t plane0 = static_cast<uint32_t>(mask6 & 0xFFFFFFFFFFull); 
-    uint32_t expected = static_cast<uint32_t>(mask5 & 0xFFFFFFFFull);
-    return plane0 == expected;
+    size_t small_var = small_inputs.size();
+    size_t large_var = large_inputs.size();
+    size_t extra_bits = large_var - small_var;
+
+    size_t total_states_large = 1ull << large_var;
+    size_t total_states_small = 1ull << small_var;
+
+    size_t extra_states = 1ull << extra_bits;
+    size_t extra_shift = small_var;
+    size_t extra_mask = extra_bits ? ((1ull << extra_bits) - 1) : 0;
+    size_t small_mask = total_states_small - 1;
+    uint64_t expected_plane = mask_small;
+    if (total_states_small < 64)
+        expected_plane &= (1ull << total_states_small) - 1;
+
+    for (size_t assign = 0; assign < extra_states; ++assign) {
+        uint64_t plane = 0;
+        for (size_t idx = 0; idx < total_states_large; ++idx) {
+            if (extra_bits) {
+                size_t extra_val = (idx >> extra_shift) & extra_mask;
+                if (extra_val != assign)
+                    continue;
+            }
+
+            size_t small_idx = idx & small_mask;
+            if (mask_large & (1ull << idx))
+                plane |= (1ull << small_idx);
+        }
+
+        if (plane == expected_plane)
+            return true;
+    }
+
+    return false;
 }
 
 int SortCutLevel(const vector<Cell*> &cells_in_level,
@@ -739,45 +731,42 @@ int SortCutLevel(const vector<Cell*> &cells_in_level,
 // bit2driver: 全局驱动映射
 // reach_set: 输出参数，收集所有通过不越界路径到达 bcut 的 leaf
 // 返回：如果存在至少一个不越界路径到达 bcut leaf，则返回 true（并填写 reach_set），否则 false。
-// vector<SigBit> collect_reachable_bcut_inputs_from(
-//     SigBit leaf,
-//     const pool<SigBit> &bcut,
-//     const pool<Cell*> &Cnodes)
-// {
-//     pool<SigBit> visited;
-//     std::stack<SigBit> st;
-// 	vector<SigBit> newleaf;
-// 	st.push(leaf);
-//     while (!st.empty()) {
-//         SigBit cur = st.top(); st.pop();
-//         if (visited.count(cur)) continue;
-//         visited.insert(cur);
+vector<SigBit> collect_reachable_bcut_inputs_from( SigBit leaf,const pool<SigBit> &bcut, const pool<Cell*> &Cnodes)
+{
+    pool<SigBit> visited;
+    std::stack<SigBit> st;
+	vector<SigBit> newleaf;
+	st.push(leaf);
+    while (!st.empty()) {
+        SigBit cur = st.top(); st.pop();
+        if (visited.count(cur)) continue;
+        visited.insert(cur);
 
-//         // 边界1：如果 cur 自身已在 bcut 中 -> 成功
-//         if (bcut.count(cur)) {
-//             newleaf.push_back(cur);
-//             continue; // 继续看其他路径，收集更多可能的 bcut leaf
-//         }
+        // 边界1：如果 cur 自身已在 bcut 中 -> 成功
+        if (bcut.count(cur)) {
+            newleaf.push_back(cur);
+            continue; // 继续看其他路径，收集更多可能的 bcut leaf
+        }
 
-//         // 若 cur 没有驱动，视为越界（PI / 网络边界），该路径无效
-//         if (!bit2driver.count(cur))
-//             continue;
+        // 若 cur 没有驱动，视为越界（PI / 网络边界），该路径无效
+        if (!bit2driver.count(cur))
+            continue;
 
-//         Cell* drv = bit2driver[cur];
+        Cell* drv = bit2driver[cur];
 
-//         // 边界2：若驱动节点不在 Cnodes 中 -> 越界，终止该路径（不返回 false，全局仍可能有其它成功路径）
-//         if (!Cnodes.count(drv))
-//             continue;
+        // 边界2：若驱动节点不在 Cnodes 中 -> 越界，终止该路径（不返回 false，全局仍可能有其它成功路径）
+        if (!Cnodes.count(drv))
+            continue;
 
-//         // 继续向上：把 drv 的所有输入推入栈
-//         vector<SigBit> fins;
-//         GetCellInputsVector(drv, fins);
-//         for (auto f : fins) st.push(f);
-//     }
+        // 继续向上：把 drv 的所有输入推入栈
+        vector<SigBit> fins;
+        GetCellInputsVector(drv, fins);
+        for (auto f : fins) st.push(f);
+    }
 
-//     // 如果找到了至少一个 bcut leaf，返回 true
-//     return newleaf;
-// }
+    // 如果找到了至少一个 bcut leaf，返回 true
+    return newleaf;
+}
 // // ---------- Helpers for localized cut-cone building and DFS mapping ----------
 
 // Build cone internal cell set for a given root and its cut (stop at leaf signals in `cut`).
@@ -812,48 +801,49 @@ static pool<Cell*> build_cone_cells(SigBit root, const pool<SigBit> &cut)
     return Cnodes;
 }
 
-// DFS from `start` (a SigBit, belonging to cutA) and try to reach any leaf in bcut.
-// The search is constrained: only follow drivers that belong to Cnodes (cone of A).
-// found_bcut_leaves will contain all bcut leaves reachable by non-escaping paths.
-// Returns true if at least one bcut leaf is found.
-static bool dfs_collect_reachable_bcut_leaves(
-    SigBit start,
-    const pool<SigBit> &bcut,
-    const pool<Cell*> &Cnodes,                     // cone cells of A (to restrict search)
-    pool<SigBit> &found_bcut_leaves)
+pool<SigBit> ConeFromBestCut(SigBit root)
 {
-    pool<SigBit> visited;
-    std::stack<SigBit> st;
-    st.push(start);
+    pool<SigBit> cone_bits;
+    std::queue<SigBit> q;
 
-    while (!st.empty()) {
-        SigBit cur = st.top(); st.pop();
-        if (visited.count(cur)) continue;
-        visited.insert(cur);
+    // 根信号本身一定属于其 cone
+    cone_bits.insert(root);
+    q.push(root);
 
-        // boundary: reached a bcut leaf
-        if (bcut.count(cur)) {
-            found_bcut_leaves.insert(cur);
-            continue; // continue collecting other possible leaves
+    const pool<SigBit> &cut = best_bit2cut.at(root);
+
+    while (!q.empty())
+    {
+        SigBit cur = q.front();
+        q.pop();
+
+        // 如果当前是 cut 边界，则停止继续向上
+        if (cut.count(cur))
+            continue;
+
+        // 向上找驱动它的 cell
+        if (!bit2driver.count(cur))
+            continue;  // PI 或模块边界，停止该路径
+        Cell *drv = bit2driver[cur];
+        if (!drv)
+            continue;
+
+        // 将 drv 的所有输入加入 BFS
+        vector<SigBit> inputs;
+        GetCellInputsVector(drv, inputs);
+        for (auto &inb : inputs)
+        {
+            // 若尚未加入 cone，则加入并继续向上
+            if (!cone_bits.count(inb))
+            {
+                cone_bits.insert(inb);
+                q.push(inb);
+            }
         }
-
-        // if no driver -> path escapes / invalid (PI or network boundary)
-        auto itdrv = bit2driver.find(cur);
-        if (itdrv == bit2driver.end()) continue;
-
-        Cell *drv = itdrv->second;
-        // if the driver is not inside A's cone => path escapes, drop this path
-        if (!Cnodes.count(drv)) continue;
-
-        // else continue up through drv inputs
-        vector<SigBit> fins;
-        GetCellInputsVector(drv, fins);
-        for (auto f : fins) st.push(f);
     }
 
-    return !found_bcut_leaves.empty();
+    return cone_bits;
 }
-
 
 //枚举并按边存储可行性对
 //图算法求得最优组队并存入twoOutputCuts
@@ -869,10 +859,10 @@ bool Bit2oCut(dict<SigBit, pool<SigBit>> &bit2cut)
         SigBit out = kv.first;
         if (!bit2driver.count(out))
             continue;
-		// if(kv.second.size() ==6){
-		// 	auto conenode=	ConeFromBestCut(out);
-		// 	cout<<"Cut size 6 output: "<<log_signal(out)<<" cone size: "<<conenode.size()<<endl;
-		// }
+		if(kv.second.size() <=4){
+			auto cone=	ConeFromBestCut(out);
+			best_cone[out]=cone;
+		}
         Cell *cell = bit2driver[out];
         if (!cell)
             continue;
@@ -1058,149 +1048,78 @@ bool Bit2oCut(dict<SigBit, pool<SigBit>> &bit2cut)
         }
     } // end per-level
 
-
-    // --- per-level localized fusion (fixed & deterministic) ---
-    for (int level : levels) {
-        auto &state = level_states[level];
-        int n = (int)state.outs.size();
+for (int level : levels) {
+        const auto &state = level_states.at(level);
+        int n = state.outs.size();
         if (n == 0) continue;
 
-        // 1) build cone_map for all roots in this level (no early skipping)
-        dict<SigBit, pool<Cell*>> cone_map;
-        for (int i = 0; i < n; ++i) {
-            SigBit root = state.outs[i];
-            // build cone for this root (stops at leaves in state.cuts[i])
-            cone_map[root] = ConeFromBestCut(root);
-        }
+        log("Level %d: checking %d cuts...\n", level, n);
 
-        // 2) build leaf -> indices map (deterministic)
-        dict<SigBit, vector<int>> leaf_to_indices;
-        for (int i = 0; i < n; ++i) {
-            SigBit root = state.outs[i];
-            if (fused_outputs.count(root)) continue;
-            if (state.cuts[i].empty()) continue;
-            for (auto bit : state.cuts[i])
-                leaf_to_indices[bit].push_back(i);
-        }
-        // normalize lists
-        for (auto &kv : leaf_to_indices) {
-            auto &vec = kv.second;
-            std::sort(vec.begin(), vec.end());
-            vec.erase(std::unique(vec.begin(), vec.end()), vec.end());
-        }
-
-        // 3) try merges: iterate cuts A by index i
-        for (int i = 0; i < n; ++i) {
+        for (int i = 0; i < n; i++) {
             SigBit rootA = state.outs[i];
-            if (fused_outputs.count(rootA)) continue;
-            auto &cutA = state.cuts[i];
-            if (cutA.empty()) continue;
-            if ((int)cutA.size() > 4) continue; // only handle small cuts as before
+			if(state.cuts[i].size()>4) continue;
+            if (!best_bit2cut.count(rootA)) continue;
+            const auto &cutA = best_bit2cut.at(rootA);
 
-            bool found_merge_for_A = false;
+            for (int j = 0; j < n; j++) {
+                if (i == j) continue;
+                SigBit rootB = state.outs[j];
+				if(state.cuts[i].size()>4) continue;
+                if (!best_cone.count(rootB)) continue;
+                const auto &coneB = best_cone.at(rootB);
 
-            // iterate leaves of A (deterministic order)
-            vector<SigBit> leavesA;
-            for (auto b : cutA) leavesA.push_back(b);
-            std::sort(leavesA.begin(), leavesA.end(), [&](const SigBit &a, const SigBit &b){
-                return std::string(log_signal(a)) < std::string(log_signal(b));
-            });
+                // 查 leaf ∈ cone
+                vector<SigBit> common_leaf;
+                for (auto leaf : cutA)
+                    if (coneB.count(leaf))
+                        common_leaf.push_back(leaf);
 
-            for (auto leaf : leavesA) {
-                // candidate B-roots whose cut contains this leaf (quick index)
-                if (!leaf_to_indices.count(leaf)) continue;
-                const auto &cands = leaf_to_indices[leaf];
+                if (!common_leaf.empty()) {
 
-                for (int j : cands) {
-                    if (j == i) continue;
-                    if (j < i) continue; // ensure deterministic single direction
-                    SigBit rootB = state.outs[j];
-                    if (fused_outputs.count(rootB)) continue;
+                    // --- 输出 rootA & its leafs
+                    log(" rootA = %s  (cut)\n", log_signal(rootA));
+                    log("   leafA (%d):", (int)cutA.size());
+                    for (auto leaf : cutA)
+                        log("     %s", log_signal(leaf));
 
-                    auto &cutB = state.cuts[j];
-                    if (cutB.empty()) continue;
-                    if ((int)cutB.size() > 4) continue;
+                    // --- 输出 rootB & its cone nodes
+log(" rootB = %s  (cone)\n", log_signal(rootB));
 
-                    // quick necessary condition: count cutA leaves whose driver in coneB
-                    int count_in_B = 0;
-                    auto &coneB = cone_map[rootB];
-                    for (auto b : cutA) {
-                        auto itdrv = bit2driver.find(b);
-                        if (itdrv == bit2driver.end()) continue;
-                        Cell *drv = itdrv->second;
-                        if (coneB.count(drv)) count_in_B++;
-                    }
-                    if ((int)cutA.size() - count_in_B + (int)cutB.size() > 5)
-                        continue;
+/* --- 打印 cutB 的 leaf 集合 --- */
+if (!best_bit2cut.count(rootB)) {
+    log("   [ERROR] best_bit2cut missing rootB = %s\n", log_signal(rootB));
+} else {
+    const pool<SigBit> &cutB = best_bit2cut.at(rootB);
+    log("   leafB (%d):\n", (int)cutB.size());
+    for (auto l : cutB)
+        log("      %s\n", log_signal(l));
+}
 
-                    // try to map some leafA -> leaf(s) in cutB by DFS constrained to coneB
-                    // Note: use coneB as the constraint for DFS (we want to reach cutB leaves without escaping B's cone)
-                    vector<SigBit> cutA_leafs;
-                    for (auto x : cutA) cutA_leafs.push_back(x);
+/* --- 打印 coneB 中对应的内部 cell 信息 --- */
+log("   coneB internal cells:\n");
+for (auto b : coneB) {
+    auto it = bit2driver.find(b);
+    if (it == bit2driver.end() || !it->second)
+        continue; // b 是 leaf 或 PI → 忽略
 
-                    bool merged_flag = false;
-                    for (auto leafA : cutA_leafs) {
-                        // only attempt if driver of leafA is inside coneB (cheap pre-check)
-                        auto itdrvA = bit2driver.find(leafA);
-                        if (itdrvA == bit2driver.end()) continue;
-                        Cell *drvA = itdrvA->second;
-                        if (!coneB.count(drvA)) continue;
+    Cell *cell = it->second;
+    log("      %s (%s)", log_id(cell->name), log_id(cell->type));
 
-                        // collect reachable leaves in cutB starting from leafA, constrained by coneB
-                        pool<SigBit> foundB;
-                        if (!dfs_collect_reachable_bcut_leaves(leafA, cutB, coneB, foundB))
-                            continue; // not reachable
-
-                        // form newCutA by replacing leafA with foundB
-                        pool<SigBit> newCutA;
-                        for (auto s : cutA) {
-                            if (s == leafA) continue;
-                            newCutA.insert(s);
-                        }
-                        for (auto s : foundB) newCutA.insert(s);
-
-                        // size constraints: newCutA CI <= 5
-                        if ((int)newCutA.size() > 5) continue;
-
-                        // union of newCutA and cutB must fit LUT6
-                        pool<SigBit> unionCut = newCutA;
-                        for (auto s : cutB) unionCut.insert(s);
-                        if ((int)unionCut.size() > 6) continue;
-
-                        // optional: intersection size check (<=5)
-                        pool<SigBit> inter;
-                        for (auto s : cutB) if (newCutA.count(s)) inter.insert(s);
-                        if ((int)inter.size() > 5) continue;
-
-                        // success: record, update and break
-                        twoOutputCuts[{rootA, rootB}] = unionCut;
-
-                        // update main mapping: A was expanded -> write back into bit2cut
-                        bit2cut[rootA] = newCutA;
-                        state.cuts[i] = newCutA; // sync level cache
-
-                        fused_outputs.insert(rootA);
-                        fused_outputs.insert(rootB);
-
-                        merged_flag = true;
-                        break;
-                    } // end try leafA
-
-                    if (merged_flag) {
-                        found_merge_for_A = true;
-                        break;
-                    }
-                } // end for cands
-
-                if (found_merge_for_A) break;
-            } // end for leaf
-
-            // if A merged, skip other attempts for this A
-            if (found_merge_for_A) continue;
-        } // end for i
-    } // end per-level
+}
 
 
+                    // --- 公共 leaf
+                    log(" Common leaf(s) (%d):", (int)common_leaf.size());
+                    for (auto leaf : common_leaf)
+                        log("     %s", log_signal(leaf));
+
+                    // --- cut大小信息
+                    log(" \ncutA size = %d", (int)cutA.size());
+                    log(" cutB leaf size = %d\n", (int)best_bit2cut.at(rootB).size());
+                }
+            }
+        }
+    }
 
     log("Bit2oCut: exit, twoOutputCuts size = %ld\n", twoOutputCuts.size());
     return true;
