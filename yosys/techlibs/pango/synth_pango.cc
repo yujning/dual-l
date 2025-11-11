@@ -3158,6 +3158,19 @@ RTLIL::Cell* addDualOutputLut(Module *module,
     pool<SigBit> cut_a = bit2cut[out_a];
     pool<SigBit> cut_b = bit2cut[out_b];
 
+    auto sanitize_cut = [&](const pool<SigBit> &cut) {
+        pool<SigBit> clean;
+        for (auto bit : cut) {
+            if (bit == out_a || bit == out_b)
+                continue;
+            clean.insert(bit);
+        }
+        return clean;
+    };
+
+    cut_a = sanitize_cut(cut_a);
+    cut_b = sanitize_cut(cut_b);
+
     bool a_is6 = cut_a.size() == 6;
     bool b_is6 = cut_b.size() == 6;
 
@@ -3169,13 +3182,13 @@ RTLIL::Cell* addDualOutputLut(Module *module,
     if (a_is6 && !b_is6) {
         out_z = out_a;
         out_z5 = out_b;
-        cut_z = cut_a;
-        cut_z5 = cut_b;
+        cut_z = sanitize_cut(cut_a);
+        cut_z5 = sanitize_cut(cut_b);
     } else if (b_is6 && !a_is6) {
         out_z = out_b;
         out_z5 = out_a;
-        cut_z = cut_b;
-        cut_z5 = cut_a;
+         cut_z = sanitize_cut(cut_b);
+        cut_z5 = sanitize_cut(cut_a);
     } else if (a_is6 && b_is6) {
         // 当前不支持 6PI + 6PI 融合
         return nullptr;
