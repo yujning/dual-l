@@ -42,151 +42,267 @@ PRIVATE_NAMESPACE_BEGIN
 
 // -----------------------
 
-constexpr int LUT_SIZE = 6;
-dict<SigBit, Cell*> bit2driver;
-struct CutInfo {
-    std::vector<SigBit> inputs;
-    SigBit output;
-    RTLIL::Const init;  // 存储 INIT 参数 (真值表)
-};
+size_t MAX_CUT_SIZE_PRE_CELL = 300;
+size_t MAX_INTERATIONS = 3;
+size_t LUT_SIZE = 6;
 
+dict<SigBit, pool<SigBit>> best_bit2cut;
+size_t cur_interation = 0;
 // using sigmap to get a unique name of each signal
 SigMap sigmap;
-dict<std::pair<SigBit,SigBit>,vector<SigBit>> twoOutputCuts;
-dict<SigBit, CutInfo> bit2cutinfo;
+dict<SigBit, Cell *> bit2driver;//信号和cell的映射
+// fast get reader or driver by sigbit
+dict<SigBit, vector<Cell *>> bit2reader;//fanout和cell的映射
+dict<Cell *, vector<SigBit>> cell2bits; // the first bit is output bits cell和fanin的映射
+
+dict<Cell *, float> cell2OptDepth;
+dict<SigBit, float> bit2height;
+dict<SigBit, float> bit2depth;
+dict<SigBit, float> bit2af;
+dict<SigBit, size_t> bit2fanout_est;
+dict<std::pair<SigBit,SigBit>,pool<SigBit>> twoOutputCuts;
+dict<Cell *, dict<pool<SigBit>, pool<Cell *>>> cell2cuts; // cell -> dict<cut, cone>
 bool using_internel_lut_type = false;
 //-------------------------------
 // functions declare here
 bool MapperMain(Module *module);
-
+bool MapperInit(Module *module);
 void SetPangoCellTypes(CellTypes *);
-void BuildBit2CutInfo(Module *module);
-bool Bit2oCut_FromBit2CutInfo();
+bool CheckCellWidth(Module *module);
+bool GetPrimeInputOuput(Module *module, pool<SigBit> &inputs, pool<SigBit> &outputs);
+bool GenerateCuts(Module *module);
+bool TraverseBWD(Module *module, const pool<SigBit> &, dict<SigBit, pool<SigBit>> &);
+bool TraverseFWD(Module *module, const pool<SigBit> &, dict<SigBit, pool<SigBit>> &);
 bool Cone2ToLUTs(Module *module,
                 dict<SigBit, pool<SigBit>> &bit2cut,
                 dict<std::pair<SigBit,SigBit>, pool<SigBit>> &twoOutputCuts);
+float GetEstimatedFanout(SigBit bit);
+vector<bool> GetCutInit(const vector<SigBit> &cut, SigBit out);
+pool<Cell *> GetReaders(Cell *cell, RTLIL::IdString port = RTLIL::IdString());
 bool Bit2oCut(dict<SigBit, pool<SigBit>> &bit2cut) ;//核心
+State StateEval(dict<SigBit, State> &bit_map, SigBit out);
+void check2ocut();
 
-
-
-SigBit GetCellOutput(Cell *cell)
+// Deterministic Edmonds' blossom (unweighted maximum matching).
+// - n: number of vertices (0..n-1)
+// - g: adjacency list (must be deterministic: neighbors sorted ascending, unique)
+// - match: output vector<int> of size n, match[v] = partner or -1
+// This implementation avoids any unordered containers or iteration over hash maps.
+void max_matching_blossom_deterministic(const vector<vector<int>> &g, vector<int> &match)
 {
-    // 优先使用标准输出端口 Y
-    if (cell->hasPort("\\Y")) {
-        RTLIL::SigSpec y = cell->getPort("\\Y");
-        if (y.size() != 1)
-            log_warning("GetCellOutput: cell %s output has size != 1\n", log_id(cell));
-        return y.as_bit();
-    }
-
-    // 尝试常见其它单输出端口名（可按需扩展）
-    static const char *fallback_ports[] = {"\\Q", "\\O", "\\OUT"};
-    for (auto name : fallback_ports) {
-        if (cell->hasPort(name)) {
-            RTLIL::SigSpec p = cell->getPort(name);
-            if (p.size() != 1)
-                log_warning("GetCellOutput: cell %s output %s size != 1\n", log_id(cell), name);
-            return p.as_bit();
-        }
-    }
-
-    log_error("GetCellOutput: cannot find single-bit output for cell %s\n", log_id(cell));
-    return SigBit(); // 永远不会到这里，log_error 会抛异常
-}
-
-//blossom_max_matching算法
-pair<vector<int>, int> max_matching(const vector<vector<int>>& g) {
     int n = (int)g.size();
-    vector<int> mate(n, -1), p(n), base(n);
-    vector<int> q;
+    match.assign(n, -1);
+
+    // helper arrays
+    vector<int> p(n), base(n), q(n);
     vector<char> used(n), blossom(n);
 
-    function<int(int,int)> lca = [&](int a, int b) {
-        vector<char> used_path(n, false);
+    auto lca = [&](int a, int b) {
+        vector<char> used_lca(n, 0);
         while (true) {
             a = base[a];
-            used_path[a] = true;
-            if (mate[a] == -1) break;
-            a = p[mate[a]];
+            used_lca[a] = 1;
+            if (match[a] == -1) break;
+            a = p[match[a]];
         }
         while (true) {
             b = base[b];
-            if (used_path[b]) return b;
-            b = p[mate[b]];
+            if (used_lca[b]) return b;
+            b = p[match[b]];
         }
     };
 
-    function<void(int,int,int)> mark_path = [&](int v, int b, int children) {
+    auto mark_path = [&](int v, int b, int x) {
         while (base[v] != b) {
-            blossom[base[v]] = blossom[base[mate[v]]] = true;
-            p[v] = children;
-            children = mate[v];
-            v = p[mate[v]];
+            blossom[base[v]] = blossom[base[match[v]]] = 1;
+            p[v] = x;
+            x = match[v];
+            v = p[match[v]];
         }
     };
 
-    function<int(int)> find_augmenting = [&](int root) -> int {
-        used.assign(n, false);
-        p.assign(n, -1);
-        for (int i = 0; i < n; ++i) base[i] = i;
-        q.clear();
-        q.push_back(root);
-        used[root] = true;
-        int qh = 0;
-        while (qh < (int)q.size()) {
+    auto find_path = [&](int root) -> bool {
+        fill(used.begin(), used.end(), 0);
+        fill(p.begin(), p.end(), -1);
+        iota(base.begin(), base.end(), 0);
+
+        int qh = 0, qt = 0;
+        q[qt++] = root;
+        used[root] = 1;
+
+        while (qh < qt) {
             int v = q[qh++];
-            for (int to : g[v]) {
-                if (base[v] == base[to] || mate[v] == to) continue;
-                if (to == root || (mate[to] != -1 && p[mate[to]] != -1)) {
-                    int curbase = lca(v, to);
-                    blossom.assign(n, false);
-                    mark_path(v, curbase, to);
-                    mark_path(to, curbase, v);
+
+            // iterate neighbors in ascending order (g is assumed sorted)
+            for (int u : g[v]) {
+                if (base[v] == base[u] || match[v] == u) continue;
+                if (u == root || (match[u] != -1 && p[match[u]] != -1)) {
+                    int curbase = lca(v, u);
+                    fill(blossom.begin(), blossom.end(), 0);
+                    mark_path(v, curbase, u);
+                    mark_path(u, curbase, v);
+                    // compress blossom: for all vertices, if blossom[base[i]] then rebase to curbase
                     for (int i = 0; i < n; ++i) {
                         if (blossom[base[i]]) {
                             base[i] = curbase;
                             if (!used[i]) {
-                                used[i] = true;
-                                q.push_back(i);
+                                used[i] = 1;
+                                q[qt++] = i;
                             }
                         }
                     }
-                } else if (p[to] == -1) {
-                    p[to] = v;
-                    if (mate[to] == -1)
-                        return to; // found augmenting path ending at 'to'
-                    to = mate[to];
-                    used[to] = true;
-                    q.push_back(to);
+                } else if (p[u] == -1) {
+                    p[u] = v;
+                    if (match[u] == -1) {
+                        // augmenting path found; augment along the path
+                        int cur = u;
+                        while (cur != -1) {
+                            int pv = p[cur];
+                            int nv = (pv == -1) ? -1 : match[pv];
+                            match[cur] = pv;
+                            if (pv != -1) match[pv] = cur;
+                            cur = nv;
+                        }
+                        return true;
+                    } else {
+                        // push the vertex matched with u
+                        int mv = match[u];
+                        if (!used[mv]) {
+                            used[mv] = 1;
+                            q[qt++] = mv;
+                        }
+                    }
                 }
-            }
-        }
-        return -1;
+            } // end for neighbors
+        } // end while queue
+        return false;
     };
 
     for (int v = 0; v < n; ++v) {
-        if (mate[v] == -1) {
-            int to = find_augmenting(v);
-            if (to == -1) continue;
-            // augment path ending at 'to'
-            int cur = to;
-            while (cur != -1) {
-                int pv = p[cur];
-                int ppv = (pv != -1 ? mate[pv] : -1);
-                mate[cur] = pv;
-                mate[pv] = cur;
-                cur = ppv;
-            }
+        if (match[v] == -1) {
+            find_path(v);
         }
     }
-
-    int match_pairs = 0;
-    for (int i = 0; i < n; ++i)
-        if (mate[i] != -1 && i < mate[i]) ++match_pairs;
-
-    return {mate, match_pairs};
 }
 
+// --- 无权一般图最大匹配 (Edmonds Blossom) ---
+void max_matching_blossom(int n, const vector<pair<int,int>> &edges, vector<int> &match) {
+    vector<vector<int>> g(n);
+    for (auto &e : edges) {
+        g[e.first].push_back(e.second);
+        g[e.second].push_back(e.first);
+    }
+
+    vector<int> p(n, -1), base(n), q(n);
+    vector<bool> used(n), blossom(n);
+
+    auto lca = [&](int a, int b) {
+        vector<bool> used2(n, false);
+        while (true) {
+            a = base[a];
+            used2[a] = true;
+            if (match[a] == -1) break;
+            a = p[match[a]];
+        }
+        while (true) {
+            b = base[b];
+            if (used2[b]) return b;
+            b = p[match[b]];
+        }
+    };
+
+    auto mark_path = [&](int v, int b, int x) {
+        while (base[v] != b) {
+            blossom[base[v]] = blossom[base[match[v]]] = true;
+            p[v] = x;
+            x = match[v];
+            v = p[match[v]];
+        }
+    };
+
+    auto bfs = [&](int start) {
+        fill(p.begin(), p.end(), -1);
+        iota(base.begin(), base.end(), 0);
+        fill(used.begin(), used.end(), false);
+        fill(q.begin(), q.end(), 0);
+        int qh = 0, qt = 0;
+        q[qt++] = start;
+        used[start] = true;
+
+        while (qh < qt) {
+            int v = q[qh++];
+            for (int u : g[v]) {
+                if (base[v] == base[u] || match[v] == u) continue;
+                if (u == start || (match[u] != -1 && p[match[u]] != -1)) {
+                    int b = lca(v, u);
+                    fill(blossom.begin(), blossom.end(), false);
+                    mark_path(v, b, u);
+                    mark_path(u, b, v);
+                    for (int i = 0; i < n; ++i)
+                        if (blossom[base[i]]) {
+                            base[i] = b;
+                            if (!used[i]) used[i] = true, q[qt++] = i;
+                        }
+                }
+                else if (p[u] == -1) {
+                    p[u] = v;
+                    if (match[u] == -1) {
+                        while (u != -1) {
+                            v = p[u];
+                            int w = match[v];
+                            match[v] = u;
+                            match[u] = v;
+                            u = w;
+                        }
+                        return true;
+                    }
+                    else {
+                        used[match[u]] = true;
+                        q[qt++] = match[u];
+                    }
+                }
+            }
+        }
+        return false;
+    };
+
+    fill(match.begin(), match.end(), -1);
+    for (int i = 0; i < n; ++i)
+        if (match[i] == -1) bfs(i);
+}
+
+
+
+bool IsNOT(Cell *cell)
+{
+	if (cell->type != ID($not) && cell->type != ID($_NOT_))
+		return false;
+	return true;
+}
+bool IsAND(Cell *cell)
+{
+	if (cell->type != ID($and) && cell->type != ID($_AND_))
+		return false;
+	return true;
+}
+bool IsOR(Cell *cell)
+{
+	if (cell->type != ID($or) && cell->type != ID($_OR_))
+		return false;
+	return true;
+}
+bool IsXOR(Cell *cell)
+{
+	if (cell->type != ID($xor) && cell->type != ID($_XOR_))
+		return false;
+	return true;
+}
+bool IsMUX(Cell *cell)
+{
+	if (cell->type != ID($mux) && cell->type != ID($_MUX_))
+		return false;
+	return true;
+}
 
 int IsGTP_LUT(Cell *cell)
 {
@@ -209,320 +325,1044 @@ bool IsGTP_LUT6D(Cell *cell)
 	return true;
 }
 bool IsGTP(Cell *cell) { return cell->type.begins_with("\\GTP_"); }
+bool IsCombinationalGate(Cell *cell) { return IsAND(cell) || IsOR(cell) || IsNOT(cell) || IsMUX(cell) || IsXOR(cell); }
+bool IsCombinationalCell(Cell *cell)
+{
+	return IsAND(cell) || IsOR(cell) || IsNOT(cell) || IsMUX(cell) || IsXOR(cell) || IsGTP_LUT(cell) || IsGTP_LUT6D(cell);
+}
+
+
+// only return this first sigbit connect to cell
+SigBit GetCellOutput(Cell *cell)
+{
+	log_assert(cell && cell2bits.count(cell));
+	auto &bits = cell2bits[cell];
+	return bits[0];
+}
+static int GetCellOutputCount(Cell *cell)
+{
+        log_assert(cell);
+        int count = 0;
+        for (auto &conn : cell->connections()) {
+                IdString portname = conn.first;
+                if (!yosys_celltypes.cell_output(cell->type, portname))
+                        continue;
+
+                RTLIL::SigSpec sig = sigmap(conn.second);
+                count += sig.size();
+        }
+        return count;
+}
+
+void GetCellInputsSet(Cell *cell, pool<SigBit> &inputs)
+{
+        log_assert(cell && inputs.empty() && cell2bits.count(cell));
+        auto &bits = cell2bits[cell];
+        int offset = GetCellOutputCount(cell);
+        log_assert(offset <= GetSize(bits));
+        for (auto it = bits.begin() + offset; it != bits.end(); ++it) {
+                inputs.insert(*it);
+        }
+}
+void GetCellInputsVector(Cell *cell, vector<SigBit> &inputs)
+{
+        log_assert(cell && inputs.empty() && cell2bits.count(cell));
+        auto &bits = cell2bits[cell];
+        int offset = GetCellOutputCount(cell);
+        log_assert(offset <= GetSize(bits));
+        for (auto it = bits.begin() + offset; it != bits.end(); ++it) {
+                inputs.push_back(*it);
+        }
+}
+
+pool<Cell *> GetReaders(Cell *cell, RTLIL::IdString port)
+{
+	pool<Cell *> ret;
+	log_assert(cell && !port.empty() && cell->connections().count(port));
+	SigSpec sig = cell->getPort(port);
+	sig = sigmap(sig);
+	for (int i = 0; i < sig.size(); i++) {
+		SigBit bit = sig[i];
+		vector<Cell *> readers = bit2reader[bit];
+		for (size_t i = 0; i < readers.size(); i++) {
+			ret.insert(readers[i]);
+		}
+	}
+	return ret;
+}
+
+// Primie input and output not means the netlist input/output.
+// It is the input of first gate which have no GTP driver,
+// or the output which have not combinational gate reader.
+bool GetPrimeInputOuput(Module *module, pool<SigBit> &inputs, pool<SigBit> &outputs)
+{
+	for (auto &cell_iter : module->cells_) {
+		Cell *cell = cell_iter.second;
+		if (!cell || !IsCombinationalGate(cell)) // only connsider the prime input and output connect to the combinational gate
+		{
+			continue;
+		}
+		for (auto &conn : cell->connections()) {
+			IdString portname = conn.first;
+			RTLIL::SigSpec sig = sigmap(conn.second);
+			if (yosys_celltypes.cell_output(cell->type, portname)) {
+				pool<Cell *> readers = GetReaders(cell, portname);
+				for (Cell *reader : readers) {
+					if (!IsCombinationalGate(reader)) {
+						outputs.insert(sig[0]);
+						break;
+					}
+				}
+				if (readers.size() < 1) {
+					outputs.insert(sig[0]);
+				}
+			} else {
+				for (int i = 0; i < sig.size(); i++) {
+					SigBit bit = sig[i];
+					Cell *drv = bit2driver.count(bit) ? bit2driver[bit] : nullptr;
+					if (!drv || !IsCombinationalGate(drv)) {
+						inputs.insert(bit);
+						break;
+					}
+				}
+			}
+		}
+	}
+	return true;
+}
+
+// return all combinational gates in module
+void GetGates(Module *module, pool<Cell *> &gates)
+{
+	gates.clear();
+	for (auto &cell_iter : module->cells_) {
+		Cell *cell = cell_iter.second;
+		if (IsCombinationalGate(cell)) {
+			gates.insert(cell);
+		}
+	}
+}
+
+void GetTopoSortedGates(Module *module, vector<Cell *> &gates)
+{
+	gates.clear();
+	pool<SigBit> prime_inputs;
+	pool<SigBit> prime_outputs;
+	GetPrimeInputOuput(module, prime_inputs, prime_outputs);
+	dict<Cell *, size_t> indegree;
+	pool<Cell *> visited;
+	queue<Cell *> zero_indegree_nodes;
+	for (auto &it : cell2bits) {
+		Cell *cell = it.first;
+		log_assert(it.second.size() > 0);
+		indegree[cell] = it.second.size() - 1; // the first is output bit
+		if (!IsCombinationalGate(cell)) {
+			continue;
+		}
+		vector<SigBit> inputs;
+		GetCellInputsVector(cell, inputs);
+		for (auto b : inputs) {
+			Cell *drv = bit2driver[b];
+			if (!drv || !IsCombinationalGate(drv)) {
+				indegree[cell]--;
+			}
+		}
+		if (indegree[cell] == 0) {
+			zero_indegree_nodes.push(cell);
+		}
+	}
+	// BFS
+	while (!zero_indegree_nodes.empty()) {
+		Cell *current = zero_indegree_nodes.front();
+		zero_indegree_nodes.pop();
+		if (!IsCombinationalGate(current) || visited.find(current) != visited.end()) {
+			continue;
+		}
+		gates.push_back(current);
+		visited.insert(current);
+		auto rds = GetReaders(current, ID(Y)); // combination gate output pin are Y
+		for (Cell *neighbor : rds) {
+			if (!IsCombinationalGate(current)) {
+				continue;
+			}
+			if (visited.count(neighbor)) {
+				log_error("toposort found loop, cell %s reader %s\n", current->name.c_str(), neighbor->name.c_str());
+			}
+			if (--indegree[neighbor] == 0) // update indegree
+			{
+				zero_indegree_nodes.push(neighbor);
+			}
+		}
+	}
+}
+pool<Cell*> ConeFromBestCut(SigBit root)
+{
+    pool<Cell*> cone;
+    std::queue<Cell*> q;
+
+    Cell *root_cell = bit2driver[root];
+    if (!root_cell) return cone;
+
+    q.push(root_cell);
+
+    const pool<SigBit> &cut = best_bit2cut.at(root);
+
+    while (!q.empty())
+    {
+        Cell* u = q.front();
+        q.pop();
+
+        // insert 返回 pair<iterator, bool>，bool = 是否首次插入
+        auto ret = cone.insert(u);
+        if (!ret.second) // 已经访问过
+            continue;
+
+        vector<SigBit> inputs;
+        GetCellInputsVector(u, inputs);
+
+        for (SigBit b : inputs)
+        {
+            // leaf = 边界，停止向上扩展
+            if (cut.count(b))
+                continue;
+
+            Cell *drv = bit2driver[b];
+            if (drv)
+                q.push(drv);
+        }
+    }
+
+    return cone;
+}
 
 
 bool MapperMain(Module *module)
-{		  SetPangoCellTypes(&yosys_celltypes);
-        twoOutputCuts.clear();
-		bit2cutinfo.clear();
-        sigmap.set(module);
-		BuildBit2CutInfo(module);
-		Bit2oCut_FromBit2CutInfo();
+{
+        CheckCellWidth(module);//初始化映射信息
+	vector<Cell *> gates;
+	GetTopoSortedGates(module, gates);//对gates排序
+	GenerateCuts(module);//对每个节点生成最初的cut，包括1-6input，存储在cell2cuts中
+	pool<SigBit> prime_inputs;
+	pool<SigBit> prime_outputs;
+	GetPrimeInputOuput(module, prime_inputs, prime_outputs);
+	log_debug("found %ld prime input and %ld prime output\n", prime_inputs.size(), prime_outputs.size());
+	// init fanout, oedges(v)
+	for (auto &p : bit2reader) {
+		bit2fanout_est[p.first] = p.second.size();//hash表赋值的一种方式，把信号fanout的数量赋值给估计值
+	}
+	dict<SigBit, pool<SigBit>> bit2cut;//co和ci的映射
+	//迭代：第一次迭代对每个cell赋值af和depth信息，统计每个bit的fanout信息
+	//第二次迭代几乎可以对大部分网络完成收敛，执行三次只是为了保险
+	for (cur_interation = 0; cur_interation < MAX_INTERATIONS; cur_interation++) {
+		bit2cut.clear();
+		TraverseFWD(module, prime_inputs, bit2cut);//为每个节点保留唯一最优cut
+		TraverseBWD(module, prime_outputs, bit2cut);//开辟cone，去除被cut覆盖的节点
+		log_debug("iteration = %ld  cut_num = %ld\n", cur_interation, bit2cut.size());
+		if (best_bit2cut.size() == 0 || bit2cut.size() < best_bit2cut.size()) {
+			best_bit2cut = bit2cut;
+		}
 
+		if (cur_interation == 0) {
+			function<void(Cell *, float)> MarkODepth = [&](Cell *cell, float ODepth) {
+				if (!cell || !IsCombinationalGate(cell)) {
+					return;
+				}
+				if (cell2OptDepth.count(cell) && cell2OptDepth[cell] >= ODepth) {
+					return;
+				}
+				cell2OptDepth[cell] = ODepth;
+				pool<SigBit> inputs;
+				GetCellInputsSet(cell, inputs);
+				for (auto bit : inputs) {
+					Cell *drv = bit2driver.count(bit) ? bit2driver[bit] : nullptr;
+					if (!drv) {
+						continue;
+					}
+					MarkODepth(drv, ODepth);
+				}
+			};
+			// the first interation depth is the optimal mapping depth
+			for (auto it = gates.rbegin(); it != gates.rend(); ++it) {
+				Cell *cell = *it;
+				SigBit bit = GetCellOutput(cell);
+				Cell *drv = bit2driver.count(bit) ? bit2driver[bit] : nullptr;
+				if (!drv || !prime_outputs.count(bit)) {
+					continue;
+				}
+				MarkODepth(drv, bit2depth[bit]);
+			}
+		}
+	}
+        log_debug("Map cut to GTP_LUT\n");
+        twoOutputCuts.clear();
+        Bit2oCut(best_bit2cut);
+        Cone2ToLUTs(module, best_bit2cut, twoOutputCuts);
         return true;
 }
 
-
-// ============ 全局结构与变量定义 ============
-void BuildBit2CutInfo(Module *module)
+// -----------------------
+bool MapperInit(Module *module)
 {
-    bit2cutinfo.clear();
-    log("Building bit2cutinfo from LUTs in module: %s\n", log_id(module));
+        log_debug("Pango init\n");
+        SetPangoCellTypes(&yosys_celltypes);
 
-    for (auto cell : module->cells())
-    {
-        std::string type = cell->type.str();
+        best_bit2cut.clear();
+        cur_interation = 0;
+        bit2driver.clear();
+        bit2reader.clear();
+        cell2bits.clear();
 
-        // 大小写无关匹配 LUT
-        std::string type_upper;
-        type_upper.reserve(type.size());
-        for (char c : type) type_upper.push_back(toupper(c));
+        cell2OptDepth.clear();
+        bit2height.clear();
+        bit2depth.clear();
+        bit2af.clear();
+        bit2fanout_est.clear();
+        cell2cuts.clear();
+        twoOutputCuts.clear();
+        sigmap.set(module);
 
-        bool is_lut = (type_upper.find("LUT") != std::string::npos)
-                      || cell->type.in(ID($lut), ID($_LUT_));
+        return true;
+}
+// bool HasCommonLeaf(const pool<SigBit> &cut1, const pool<SigBit> &cut2) {
+//     for (auto &sig : cut1) {
+//         if (cut2.count(sig)) return true;
+//     }
+//     return false;
+// }
+bool CheckCutEquiv(const pool<SigBit>& cut1, SigBit out1,
+                   const pool<SigBit>& cut2, SigBit out2)
+{
+    const pool<SigBit> *six_cut = nullptr;
+    const pool<SigBit> *five_cut = nullptr;
+    SigBit six_out, five_out;
 
-        if (!is_lut)
-            continue;
+    if (cut1.size() == 6 && cut2.size() == 5) {
+        six_cut = &cut1;
+        five_cut = &cut2;
+        six_out = out1;
+        five_out = out2;
+    } else if (cut2.size() == 6 && cut1.size() == 5) {
+six_cut = &cut2;
+five_cut = &cut1;
+        six_out = out2;
+        five_out = out1;
+    } else {
+        return false;
+    }
 
-        // 获取输出端口
-        SigBit out;
-        if (cell->hasPort(ID(Y)))
-            out = cell->getPort(ID(Y)).as_bit();
-        else if (cell->hasPort(ID(O)))
-            out = cell->getPort(ID(O)).as_bit();
-        else
-            continue;
+    std::vector<SigBit> five_inputs;
+    for (auto bit : *five_cut)
+        five_inputs.push_back(bit);
 
-        // 获取输入端口
-        SigSpec inputs_spec;
-        if (cell->hasPort(ID(A)))
-            inputs_spec = cell->getPort(ID(A));
-        else if (cell->hasPort(ID(I)))
-            inputs_spec = cell->getPort(ID(I));
-        else
-            continue;
+    pool<SigBit> subset_bits;
+    for (auto &bit : five_inputs) {
+        if (subset_bits.count(bit))
+            return false;
+subset_bits.insert(bit);
+        if (!six_cut->count(bit))
+            return false;
+    }
 
-        int k = inputs_spec.size();
-        if (k == 0 || k > 6)
-            continue;
+    std::vector<SigBit> six_inputs;
+    six_inputs.reserve(6);
+    for (auto &bit : five_inputs)
+        six_inputs.push_back(bit);
+    for (auto bit : *six_cut)
+        if (!subset_bits.count(bit))
+            six_inputs.push_back(bit);
 
-        std::vector<SigBit> inputs;
-        inputs.reserve(k);
-        for (auto b : inputs_spec)
-            inputs.push_back(b);
+    if (six_inputs.size() != 6)
+        return false;
 
-        // 获取 INIT 参数
-        RTLIL::Const init;
-        if (cell->hasParam(ID(INIT)))
-            init = cell->getParam(ID(INIT));
-        else if (cell->hasParam(ID(MASK)))
-            init = cell->getParam(ID(MASK));
-        else if (cell->hasParam(ID(LUT)))
-            init = cell->getParam(ID(LUT));
-        else
-            continue;
+    auto eval_mask = [&](const std::vector<SigBit> &inputs, SigBit out, uint64_t &mask) -> bool {
+        mask = 0;
+        size_t limit = 1ull << inputs.size();
+        for (size_t idx = 0; idx < limit; ++idx) {
+            dict<SigBit, State> assignment;
+            for (size_t b = 0; b < inputs.size(); ++b)
+                assignment[inputs[b]] = ((idx >> b) & 1) ? State::S1 : State::S0;
 
-        if ((int)init.bits().size() != (1 << k)) {
-            log_warning("LUT %s: INIT size mismatch (%d vs %d)\n",
-                        log_id(cell), int(init.bits().size()), 1 << k);
-            continue;
+            State val = StateEval(assignment, out);
+            if (val == State::Sx)
+                return false;
+            if (val == State::S1)
+                mask |= (1ull << idx);
         }
-
-        // 构建 CutInfo 并插入全局 bit2cutinfo
-        CutInfo info;
-        info.output = out;
-        info.inputs = inputs;
-        info.init = init;
-        bit2cutinfo[out] = info;
-
-        // 调试输出
-        // log("  [%s] LUT%d output=%s inputs(%d)=",
-        //     log_id(cell), k, log_signal(out), k);
-        // for (auto &b : inputs)
-        //     log(" %s", log_signal(b));
-        // log("\n    INIT = ");
-        // for (int i = (1 << k) - 1; i >= 0; --i)
-        //     log("%c", init.bits()[i] == State::S1 ? '1' : '0');
-        // log("\n");
-    }
-
-    log("BuildBit2CutInfo: total LUTs = %d\n", GetSize(bit2cutinfo));
-}
-bool Bit2oCut(dict<SigBit, pool<SigBit>> &bit2cut)
-{
-    bit2cut.clear();
-    pool<SigBit> primary_inputs;
-    pool<Cell*> topo_cells;
-
-    // 遍历电路，找出 primary input（无驱动）
-    for (auto &p : bit2cutinfo) {
-        for (auto in : p.second.inputs)
-            if (!bit2cutinfo.count(in))
-                primary_inputs.insert(in);
-    }
-
-    // 初始化 PI cut
-    for (auto &pi : primary_inputs)
-        bit2cut[pi].insert(pi);
-
-    // 拓扑遍历（假设 bit2cutinfo 已是 DAG）
-    std::queue<SigBit> q;
-    for (auto &p : bit2cutinfo)
-        q.push(p.first);
-
-    while (!q.empty()) {
-        SigBit out = q.front();
-        q.pop();
-
-        const CutInfo &ci = bit2cutinfo[out];
-        pool<SigBit> merged_cut;
-        for (auto in : ci.inputs) {
-            merged_cut.insert(bit2cut[in].begin(), bit2cut[in].end());
-        }
-
-        // 限制 cut 大小不超过 6
-        while (merged_cut.size() > 6) {
-            // 剪枝策略：删除扇出最小或随机节点
-            merged_cut.erase(merged_cut.begin());
-        }
-
-        bit2cut[out] = merged_cut;
-    }
-
-    log("Bit2oCut: total cuts = %d\n", GetSize(bit2cut));
-    return true;
-}
-
-State StateEval(const dict<SigBit, State> &assign, SigBit bit)
-{
-    // 已赋值直接返回
-    if (assign.count(bit))
-        return assign.at(bit);
-
-    // 如果 bit 是常量
-    if (bit == State::S0) return State::S0;
-    if (bit == State::S1) return State::S1;
-
-    // 从 bit2cutinfo 查找驱动 LUT
-    if (!bit2cutinfo.count(bit))
-        return State::Sx; // 无定义
-
-    const CutInfo &ci = bit2cutinfo.at(bit);
-    int k = ci.inputs.size();
-
-    int idx = 0;
-    for (int i = 0; i < k; i++) {
-        State s = StateEval(assign, ci.inputs[i]);
-        if (s == State::Sx) return State::Sx;
-        if (s == State::S1)
-            idx |= (1 << i);
-    }
-
-   return ci.init[idx];
-
-
-
-}
-std::vector<bool> GetCutInit(const std::vector<SigBit> &cut, SigBit output)
-{
-    int n = cut.size();
-    int mask_num = 1 << n;
-    std::vector<bool> init(mask_num);
-
-    for (int m = 0; m < mask_num; ++m) {
-        dict<SigBit, State> assign;
-        for (int i = 0; i < n; i++)
-            assign[cut[i]] = ((m >> i) & 1) ? State::S1 : State::S0;
-
-        State val = StateEval(assign, output);
-        init[m] = (val == State::S1);
-    }
-    return init;
-}
-bool IsCombinationalGate(Cell *cell)
-{
-    static const pool<IdString> seq_types = {
-        ID(GTP_DFF), ID(GTP_DFF_C), ID(GTP_DFF_R),
-        ID(GTP_DFF_S), ID(GTP_DLATCH), ID(GTP_RAM32X1SP),
-        ID(GTP_RAM64X1SP)
+        return true;
     };
 
-    if (seq_types.count(cell->type))
+    uint64_t mask6 = 0, mask5 = 0;
+    if (!eval_mask(six_inputs, six_out, mask6))
+        return false;
+    if (!eval_mask(five_inputs, five_out, mask5))
         return false;
 
-    if (cell->type.str().find("LUT") != std::string::npos)
-        return true;
-
-    if (cell->type.str().find("BUF") != std::string::npos)
-        return false;
-
-    // 默认认为有输入输出的纯组合门
-    return cell->hasPort(ID(A)) || cell->hasPort(ID(I));
+ uint32_t plane0 = static_cast<uint32_t>(mask6 & 0xFFFFFFFFFFull); 
+    uint32_t expected = static_cast<uint32_t>(mask5 & 0xFFFFFFFFull);
+    return plane0 == expected;
 }
-
-
-bool HasCommonLeaf(const pool<SigBit> &cut1, const pool<SigBit> &cut2)
-{
-    // 选择较小和较大的集合
-    const pool<SigBit> &smaller = (cut1.size() <= cut2.size()) ? cut1 : cut2;
-    const pool<SigBit> &larger  = (cut1.size() <= cut2.size()) ? cut2 : cut1;
-
-    for (auto &sig : smaller) {
-        if (larger.count(sig)) {
-            return true; // 有一个包含
-        }
-    }
-    return false; 
-}
-
 
 int SortCutLevel(const vector<Cell*> &cells_in_level,
                   dict<SigBit, pool<SigBit>> &bit2cut,
                   vector<pair<Cell*, int>> &cell_pi_list)
 {
     cell_pi_list.clear();
-   int  num_six_input = 0;
-
-    vector<pair<Cell*, int>> six_list;
-    vector<pair<Cell*, int>> other_list;
 
     for (auto *cell : cells_in_level) {
         SigBit out = GetCellOutput(cell);
-        int pi_size = bit2cut[out].size();
-        if (pi_size == 6)
-            six_list.push_back({cell, pi_size});
-        else
-            other_list.push_back({cell, pi_size});
+        int pi_size = bit2cut.count(out) ? bit2cut[out].size() : 0;
+        cell_pi_list.push_back({cell, pi_size});
     }
 
-    // 6-input 的放前面
-    cell_pi_list.insert(cell_pi_list.end(), six_list.begin(), six_list.end());
-    cell_pi_list.insert(cell_pi_list.end(), other_list.begin(), other_list.end());
+    std::sort(cell_pi_list.begin(), cell_pi_list.end(),
+              [](const pair<Cell*, int> &a, const pair<Cell*, int> &b) {
+                  if (a.second != b.second)
+                      return a.second > b.second;
+                  return a.first->name < b.first->name;
+              });
 
-    num_six_input = six_list.size();
+    int num_six_input = 0;
+    for (auto &item : cell_pi_list) {
+        if (item.second == 6)
+            num_six_input++;
+        else
+            break;
+    }
+
     return num_six_input;
 }
-//补充：等价验证函数，对于6picut进行验证
-//枚举并按边存储可行性对
-//图算法求得最优组队并存入twoOutputCuts
-// 全局结构
 
-bool Bit2oCut_FromBit2CutInfo()
+
+bool can_reach_Cleaf_without_escape(SigBit start,
+                                   pool<SigBit>& Ccut,
+                                   pool<Cell*>& Cnodes,  // cone 内部 cell
+                                   dict<SigBit, Cell*>& bit2driver)
 {
-    log("Bit2oCut_FromBit2CutInfo: entry, total LUTs = %d\n", GetSize(bit2cutinfo));
-    twoOutputCuts.clear();
+    std::unordered_set<SigBit> visited;
+    std::stack<SigBit> st;
+    st.push(start);
 
-    // 将所有项转为 vector 方便遍历
-    std::vector<std::pair<SigBit, CutInfo>> entries(bit2cutinfo.begin(), bit2cutinfo.end());
-    int n = entries.size();
+    while (!st.empty()) {
+        SigBit b = st.top(); st.pop();
+        if (visited.count(b)) continue;
+        visited.insert(b);
 
-    int merge_cnt = 0;
+        // ① 如果已经落到 Ccut 的 leaf → 成功
+        if (Ccut.count(b))
+            return true;
 
-    for (int i = 0; i < n; i++) {
-        const auto &A = entries[i].second;
-        const std::vector<SigBit> &inA = A.inputs;
-		if(inA.size()==6) continue;
-        for (int j = i + 1; j < n; j++) {
-            const auto &B = entries[j].second;
-            const std::vector<SigBit> &inB = B.inputs;
-						if(inB.size()==6) continue;
-            // 计算交集
-            bool has_common = false;
-            for (auto &a : inA)
-                for (auto &b : inB)
-                    if (a == b) { has_common = true; break; }
-            if (!has_common) continue;
+        // ② 如果没有驱动，说明 b 是外界信号（PI/外部），则逃出 cone → 不合法
+        if (!bit2driver.count(b))
+            continue;  // 直接视为失败路径
 
-            // 构造输入并集
-            std::vector<SigBit> merged = inA;
-            for (auto &b : inB)
-                if (std::find(merged.begin(), merged.end(), b) == merged.end())
-                    merged.push_back(b);
+        Cell* drv = bit2driver[b];
 
-            // 限制：最多6输入
-            if ((int)merged.size() > 5) continue;
+        // ③ 如果驱动节点不在 Ccone 中 → 越界，不合法，丢掉这个路径
+        if (!Cnodes.count(drv))
+            continue;
 
-            // 记录融合
-            twoOutputCuts[{A.output, B.output}] = merged;
-            merge_cnt++;
-
-            // 调试输出
-          //  log("  [FUSE] %s + %s -> merged_inputs(%d):",
-                // log_signal(A.output), log_signal(B.output), (int)merged.size());
-            // for (auto &m : merged) log(" %s", log_signal(m));
-            // log("\n");
-
-            // 一个输出只参与一次融合（可改）
-            break;
-        }
+        // ④ 继续沿驱动节点的所有输入 DFS
+        vector<SigBit> fins;
+        GetCellInputsVector(drv, fins);
+        for (auto fin : fins)
+            st.push(fin);
     }
 
-    log("Bit2oCut_FromBit2CutInfo: total merged pairs = %d\n", merge_cnt);
+    // 遍历结束仍未到 Ccut → 不存在公共输入
+    return false;
+}
+
+//枚举并按边存储可行性对
+//图算法求得最优组队并存入twoOutputCuts
+bool Bit2oCut(dict<SigBit, pool<SigBit>> &bit2cut)
+{
+    log("Bit2oCut: entry, bit2cut size = %ld\n", bit2cut.size());
+    twoOutputCuts.clear();
+
+    pool<SigBit> fused_outputs;
+
+    dict<int, vector<Cell*>> level2cells;
+    for (auto &kv : bit2cut) {
+        SigBit out = kv.first;
+        if (!bit2driver.count(out))
+            continue;
+		if(kv.second.size() ==6){
+			auto conenode=	ConeFromBestCut(out);
+			cout<<"Cut size 6 output: "<<log_signal(out)<<" cone size: "<<conenode.size()<<endl;
+		}
+        Cell *cell = bit2driver[out];
+        if (!cell)
+            continue;
+        int depth = static_cast<int>(bit2depth[out]);
+        level2cells[depth].push_back(cell);
+    }
+
+    vector<int> levels;
+    for (auto &kv : level2cells)
+        levels.push_back(kv.first);
+    std::sort(levels.begin(), levels.end());
+
+    // ✅ 精简后的数据结构
+    struct LevelState {
+        vector<SigBit> outs;            // 输出比特
+        vector<pool<SigBit>> cuts;      // 每个输出对应 CUT
+    };
+
+    dict<int, LevelState> level_states;
+
+    // --- 构建每层的 outs + cuts ---
+    for (int level : levels) {
+        auto &cells = level2cells[level];
+        vector<pair<Cell*, int>> cell_pi_list;
+        int six_num = SortCutLevel(cells, bit2cut, cell_pi_list);
+
+        size_t n = cell_pi_list.size();
+        if (n == 0)
+            continue;
+
+        LevelState state;
+        state.outs.resize(n);
+        state.cuts.resize(n);
+
+        for (size_t i = 0; i < n; ++i) {
+            state.outs[i] = GetCellOutput(cell_pi_list[i].first);
+            state.cuts[i] = bit2cut[state.outs[i]];
+        }
+
+        // --- 保留你原始的 small-big 初步融合逻辑 ---
+        for (int i = 0; i < (int)n; ++i) {
+            if (i < six_num) {
+                for (int j = six_num; j < (int)n; ++j) {
+                    if (state.cuts[j].size() == 6) continue;
+                    if (fused_outputs.count(state.outs[i]) || fused_outputs.count(state.outs[j])) continue;
+                    if (!CheckCutEquiv(state.cuts[i], state.outs[i], state.cuts[j], state.outs[j])) continue;
+
+                    pool<SigBit> merged = state.cuts[i];
+                    merged.insert(state.cuts[j].begin(), state.cuts[j].end());
+                    if (merged.size() > 6) continue;
+
+                    twoOutputCuts[{state.outs[i], state.outs[j]}] = merged;
+                    fused_outputs.insert(state.outs[i]);
+                    fused_outputs.insert(state.outs[j]);
+                }
+            }
+        }
+
+        level_states[level] = state;
+    }
+       // --- Deterministic per-level global matching ---
+    for (int level : levels) {
+        auto &state = level_states[level];
+        int n = (int)state.outs.size();
+        if (n == 0) continue;
+
+        // 1) create stable mapping arrays outs_st / cuts_st sorted by stable key of outs
+        std::vector<int> order(n);
+        std::iota(order.begin(), order.end(), 0);
+        std::sort(order.begin(), order.end(), [&](int a, int b) {
+            std::string sa = std::string(log_signal(state.outs[a]));
+            std::string sb = std::string(log_signal(state.outs[b]));
+            if (sa != sb) return sa < sb;
+            return a < b;
+        });
+        std::vector<SigBit> outs_st(n);
+        std::vector<pool<SigBit>> cuts_st(n);
+        for (int i = 0; i < n; ++i) {
+            outs_st[i] = state.outs[order[i]];
+            cuts_st[i] = state.cuts[order[i]];
+        }
+
+        // 2) build deterministic inverted index: leaf -> vector<int> (indices into outs_st/cuts_st)
+        dict<SigBit, std::vector<int>> leaf_to_indices;
+        for (int i = 0; i < n; ++i) {
+            if (cuts_st[i].size() > 5) continue;
+            if (fused_outputs.count(outs_st[i])) continue;
+            // gather bits, sort by stable key
+            std::vector<SigBit> bits;
+            bits.reserve(cuts_st[i].size());
+            for (auto b : cuts_st[i]) bits.push_back(b);
+            std::sort(bits.begin(), bits.end(), [&](const SigBit &a, const SigBit &b){
+                return std::string(log_signal(a)) < std::string(log_signal(b));
+            });
+            bits.erase(std::unique(bits.begin(), bits.end()), bits.end());
+            for (auto bit : bits) leaf_to_indices[bit].push_back(i);
+        }
+
+        // normalize each value list (sort + unique)
+        std::vector<SigBit> keys;
+        for (auto &kv : leaf_to_indices) keys.push_back(kv.first);
+        std::sort(keys.begin(), keys.end(), [&](const SigBit &a, const SigBit &b){
+            return std::string(log_signal(a)) < std::string(log_signal(b));
+        });
+        for (auto &k : keys) {
+            auto &v = leaf_to_indices[k];
+            std::sort(v.begin(), v.end());
+            v.erase(std::unique(v.begin(), v.end()), v.end());
+        }
+
+        // 3) enumerate all candidate edges (i<j) deterministically and store merged cuts
+        std::vector<std::pair<int,int>> edges;
+        edges.reserve(1024);
+        std::map<std::pair<int,int>, pool<SigBit>> edgeMergedCut; // ordered map -> deterministic iteration
+
+        for (int i = 0; i < n; ++i) {
+            if (cuts_st[i].size() > 5) continue;
+            if (fused_outputs.count(outs_st[i])) continue;
+
+            std::vector<SigBit> bits;
+            bits.reserve(cuts_st[i].size());
+            for (auto b : cuts_st[i]) bits.push_back(b);
+            std::sort(bits.begin(), bits.end(), [&](const SigBit &a, const SigBit &b){
+                return std::string(log_signal(a)) < std::string(log_signal(b));
+            });
+            bits.erase(std::unique(bits.begin(), bits.end()), bits.end());
+
+            for (auto bit : bits) {
+                auto it = leaf_to_indices.find(bit);
+                if (it == leaf_to_indices.end()) continue;
+                const auto &cand = it->second;
+                for (int j : cand) {
+                    if (j <= i) continue;
+                    if (cuts_st[j].size() > 5) continue;
+                    if (fused_outputs.count(outs_st[j])) continue;
+
+                    pool<SigBit> merged = cuts_st[i];
+                    for (auto b : cuts_st[j]) merged.insert(b);
+                    if (merged.size() > 6) continue;
+
+                    std::pair<int,int> key = std::make_pair(i, j);
+                    edges.emplace_back(key);
+                    edgeMergedCut[key] = merged;
+                }
+            }
+        }
+
+        // 4) sort & unique edges to make them deterministic
+        std::sort(edges.begin(), edges.end(), [](const std::pair<int,int> &a, const std::pair<int,int> &b){
+            if (a.first != b.first) return a.first < b.first;
+            return a.second < b.second;
+        });
+        edges.erase(std::unique(edges.begin(), edges.end()), edges.end());
+
+        // 5) build adjacency list g (deterministic) from edges
+        std::vector<std::vector<int>> g(n);
+        for (auto &e : edges) {
+            int a = e.first, b = e.second;
+            g[a].push_back(b);
+            g[b].push_back(a);
+        }
+        for (int v = 0; v < n; ++v) {
+            std::sort(g[v].begin(), g[v].end());
+            g[v].erase(std::unique(g[v].begin(), g[v].end()), g[v].end());
+        }
+
+        // 6) deterministic matching
+        std::vector<int> mate;
+        max_matching_blossom_deterministic(g, mate);
+
+        // 7) apply matches: write twoOutputCuts using outs_st mapping
+        for (int i = 0; i < n; ++i) {
+            int j = mate[i];
+            if (j == -1 || i > j) continue;
+            auto key = std::make_pair(i, j);
+            auto it = edgeMergedCut.find(key);
+            if (it == edgeMergedCut.end()) continue;
+            const pool<SigBit> &merged = it->second;
+            // write using original SigBit values outs_st[i], outs_st[j]
+            twoOutputCuts[{outs_st[i], outs_st[j]}] = merged;
+            fused_outputs.insert(outs_st[i]);
+            fused_outputs.insert(outs_st[j]);
+        }
+    } // end per-level
+
+
+	//侧扇出融合算法
+	for (int level : levels) {
+    auto &state = level_states[level];
+    int n = (int)state.outs.size();
+    if (n == 0) continue;
+
+    for (int idx = 0; idx < n; ++idx) {
+        SigBit Cout = state.outs[idx];
+        if (fused_outputs.count(Cout)) continue;
+
+        pool<SigBit> &Ccut = state.cuts[idx];
+        if ((int)Ccut.size() > 4) continue; // 只处理cut大小<=4的
+
+        // 获取 root cell
+        Cell *Croot = bit2driver[Cout];
+        if (!Croot) continue;
+
+        vector<SigBit> fanins;
+        GetCellInputsVector(Croot, fanins);
+
+        // 构建 Ccut 内部节点集合
+        auto Cnodes =ConeFromBestCut(Cout);
+
+        for (auto fin : fanins) {
+            // 找 fin 的 fanout（节点级 fanout）
+            auto it_rd = bit2reader.find(fin);
+            if (it_rd == bit2reader.end()) continue;
+
+            for (Cell *Troot : it_rd->second) {
+                SigBit Tout = GetCellOutput(Troot);
+                if (!bit2cut.count(Tout)) continue;
+                if (fused_outputs.count(Tout)) continue;
+
+                pool<SigBit> &Tcut = bit2cut[Tout];
+                if ((int)Tcut.size() > 4) continue;
+
+                // ========== 判断 Tcut 中哪些是 Ccut 内部节点 ==========
+                // Tcut ∩ Ccut 内部节点数量可直接用于扩展
+                pool<SigBit> new_ext;
+                pool<SigBit> Tcut_nonC;
+
+			for (auto b : Tcut) {
+				Cell* drv = nullptr;
+				if (bit2driver.count(b)) drv = bit2driver[b];
+
+				if (drv && Cnodes.count(drv)) {
+					// b 是 Ccut 内部节点输出 → 可作为扩展支撑
+					new_ext.insert(b);
+				} else {
+					// b 是真正的 leaf（不在内部 cone 中）
+					Tcut_nonC.insert(b);
+				}
+			}
+
+                // 若扩展后 CI 数不超过 5 则允许融合
+                int new_ci_cnt = (Ccut.size() + Tcut_nonC.size());
+                if (new_ci_cnt > 5) continue;
+auto expand_one = [&](SigBit b, pool<SigBit> &Ccut) -> bool {
+    // 沿驱动向前寻找真正的 leaf
+    SigBit cur = b;
+
+    while (true) {
+        // 如果 cur 已经在 Ccut 里 → 说明找到了 leaf，成功
+        if (Ccut.count(cur)) return true;
+
+        // 如果 cur 没有 driver → 说明它是 PI 或网络边界 → cut 外溢出，不合法，失败
+        if (!bit2driver.count(cur)) return false;
+
+        Cell* d = bit2driver[cur];
+
+        // 如果驱动节点不在 Ccone 中 → 扩展越界，不合法
+        if (!Cnodes.count(d)) return false;
+
+        // 否则继续向前：把 cur 替换为它的输入之一继续追溯
+        // 但 **必须保证输入中只有一个方向落在 cone 内，才能保持唯一性**
+        SigBit next = SigBit();
+        int cnt = 0;
+        for (auto in : d->connections()["A"]) {  // 你根据你自己的 cell 输入口名改
+            if (Cnodes.count(bit2driver[in])) {
+                next = in;
+                cnt++;
+            }
+        }
+        // 如果输入方向 >1，意味着该节点是内部 reconvergent，路径不唯一 → 不可扩展
+        if (cnt != 1) return false;
+
+        cur = next;
+    }
+};
+
+// ==== 扩展阶段 ====
+pool<SigBit> newCcut = Ccut;
+for (auto b : new_ext) {
+    if (!expand_one(b, newCcut)) {
+        // 有一个无法扩展 → 整个融合失败
+        goto FAIL_FUSION;
+    }
+    newCcut.insert(b);
+}
+                // ========== 执行扩展：将 Ccut 内部节点对应支持扩进来 ==========
+                pool<SigBit> newCcut = Ccut;
+                for (auto b : Tcut_nonC) newCcut.insert(b);
+
+                // 最终 merged = newCcut ∪ Tcut
+                pool<SigBit> merged = newCcut;
+                for (auto b : Tcut) merged.insert(b);
+                if (merged.size() > 6) continue;
+
+                // ======= 记录融合结果 =======
+                twoOutputCuts[{Cout, Tout}] = merged;
+                fused_outputs.insert(Cout);
+                fused_outputs.insert(Tout);
+            }
+        }
+    }
+}
+
+    log("Bit2oCut: exit, twoOutputCuts size = %ld\n", twoOutputCuts.size());
     return true;
 }
 
 
+bool GetBestCut(Cell *cell, pool<SigBit> &cut_selected)
+{
+        cut_selected.clear();
 
+        const dict<pool<SigBit>, pool<Cell *>> &cuts = cell2cuts[cell];
+        if (cuts.size() == 1) {
+                cut_selected = cuts.begin()->first;
+                return cut_selected.size() > 0;
+        }
+
+        log_assert(cuts.size() > 0);
+
+        const float depth_eps = 0.01f;
+        const float cost_eps = 1e-3f;
+        const bool first_pass = (cur_interation == 0);
+
+        float selected_depth = std::numeric_limits<float>::infinity();
+        float selected_cost = std::numeric_limits<float>::infinity();
+
+        float min_area_metric = std::numeric_limits<float>::infinity();
+        pool<SigBit> min_area_cut;
+
+        SigBit outbit = GetCellOutput(cell);
+        float required_depth = std::numeric_limits<float>::infinity();
+        if (!first_pass && cell2OptDepth.count(cell)) {
+                required_depth = cell2OptDepth[cell] - bit2height[outbit];
+        }
+
+        for (auto cutpair : cuts) {
+                const pool<SigBit> &cur_cut = cutpair.first;
+                if (cur_cut.empty())
+                        continue;
+
+                float cur_depth = 0.0f;
+                float cur_af = 0.0f;
+                float fanout_term = 0.0f;
+
+                for (auto &bit : cur_cut) {
+                        cur_depth = max(bit2depth[bit], cur_depth);
+                        cur_af += bit2af[bit];
+
+                        float fo_est = 1.0f;
+                        if (bit2fanout_est.count(bit)) {
+                                fo_est = bit2fanout_est[bit];
+                        } else if (bit2reader.count(bit)) {
+                                fo_est = bit2reader[bit].size();
+                        }
+                        fanout_term += 1.0f / max(1.0f, fo_est);
+                }
+
+                float area_metric = cur_af + cur_cut.size();
+                if (area_metric < min_area_metric) {
+                        min_area_metric = area_metric;
+                        min_area_cut = cur_cut;
+                }
+
+                float slack = std::numeric_limits<float>::infinity();
+                if (std::isfinite(required_depth)) {
+                        slack = required_depth - cur_depth;
+                }
+
+                if (!first_pass && std::isfinite(slack) && slack < -depth_eps)
+                        continue;
+
+                const float depth_weight = first_pass ? 3.0f : 1.25f;
+                const float area_weight = first_pass ? 1.0f : 2.35f;
+                const float fanout_weight = 0.6f;
+                const float slack_penalty = 6.0f;
+                const float slack_bonus = 0.35f;
+
+                float slack_cost = 0.0f;
+                if (std::isfinite(slack)) {
+                        if (slack >= 0.0f) {
+                                slack_cost = -slack_bonus * std::min(slack, 2.0f);
+                        } else {
+                                slack_cost = slack_penalty * (-slack);
+                        }
+                }
+
+                float cur_cost = depth_weight * (cur_depth + 1.0f) +
+                                 area_weight * area_metric +
+                                 fanout_weight * fanout_term +
+                                 slack_cost;
+
+                if (first_pass) {
+                        if (cur_depth + depth_eps < selected_depth) {
+                                cut_selected = cur_cut;
+                                selected_depth = cur_depth;
+                                selected_cost = cur_cost;
+                        } else if (fabs(cur_depth - selected_depth) <= depth_eps && cur_cost + cost_eps < selected_cost) {
+                                cut_selected = cur_cut;
+                                selected_cost = cur_cost;
+                        }
+                } else {
+                        if (cur_cost + cost_eps < selected_cost) {
+                                cut_selected = cur_cut;
+                                selected_cost = cur_cost;
+                                selected_depth = cur_depth;
+                        } else if (fabs(cur_cost - selected_cost) <= cost_eps && cur_depth < selected_depth - depth_eps) {
+                                cut_selected = cur_cut;
+                                selected_depth = cur_depth;
+                        }
+                }
+        }
+
+        if (cut_selected.empty()) {
+                cut_selected = min_area_cut;
+        }
+
+        return cut_selected.size() > 0;
+}
+float GetEstimatedFanout(SigBit bit)
+{
+	float alpha = 2.5;
+	size_t fanout_est = bit2fanout_est[bit];
+	size_t fanout = bit2reader[bit].size();
+	float est = (fanout_est + alpha * fanout) / (1 + alpha);
+	return est;
+}
+
+bool UpdateCutDepthAf(const pool<SigBit> &cut_selected, Cell *cell, SigBit outbit)
+{//面积全是0
+        float depth = 0;
+        float af = 0;
+        for (auto &bit : cut_selected) {
+                af += bit2af[bit];
+                depth = max(depth, bit2depth[bit]);
+        }
+
+        float fanout_est = max(1.0f, GetEstimatedFanout(outbit));
+        float updated_depth = depth + 1.0f;
+        if (bit2depth.count(outbit)) {
+                bit2depth[outbit] = max(bit2depth[outbit], updated_depth);
+        } else {
+                bit2depth[outbit] = updated_depth;
+        }
+
+        float raw_af = (af + cut_selected.size()) / fanout_est;
+        if (bit2af.count(outbit)) {
+                bit2af[outbit] = 0.6f * bit2af[outbit] + 0.4f * raw_af;
+        } else {
+                bit2af[outbit] = raw_af;
+        }
+        return true;
+}
+
+bool TraverseFWD(Module *module, const pool<SigBit> &prime_inputs, dict<SigBit, pool<SigBit>> &bit2cut)
+{
+        for (SigBit pi : prime_inputs) {
+                bit2depth[pi] = 0.0;
+                bit2af[pi] = 0.0;
+                size_t fo_actual = 0;
+                if (bit2reader.count(pi)) {
+                        fo_actual = bit2reader[pi].size();
+                }
+                bit2fanout_est[pi] = std::max<size_t>(1, fo_actual);
+        }
+
+        vector<Cell *> gates;
+        GetTopoSortedGates(module, gates);
+        for (size_t i = 0; i < gates.size(); i++) {
+                pool<SigBit> cut_selected;
+                //此处对每个cell单独求解
+                if (!GetBestCut(gates[i], cut_selected)) {//取得每个cell的延迟最优情况下的面积最优cut
+                        log_error(" not selected cut %s\n", gates[i]->name.c_str());
+                }
+                SigBit outbit = GetCellOutput(gates[i]);
+                bit2cut[outbit] = cut_selected;
+                UpdateCutDepthAf(cut_selected, gates[i], outbit);//对每个cell更新depth和af
+
+                size_t fo_actual = 0;
+                if (bit2reader.count(outbit)) {
+                        fo_actual = bit2reader[outbit].size();
+                }
+                float prev_est = bit2fanout_est.count(outbit) ? bit2fanout_est[outbit] : std::max<size_t>(1, fo_actual);
+                float blended = 0.5f * prev_est + 0.5f * std::max<size_t>(1, fo_actual);
+                size_t fo_update = std::max<size_t>(1, static_cast<size_t>(std::lround(blended)));
+                bit2fanout_est[outbit] = fo_update;
+        }
+        return true;
+}
+bool TraverseBWD(Module *module, const pool<SigBit> &prime_outputs, dict<SigBit, pool<SigBit>> &bit2cut)
+{
+	dict<SigBit, pool<SigBit>> map_result;
+	dict<SigBit, size_t> bit2fanout_bwd;
+	pool<Cell *> s_for_check;
+	for (SigBit po : prime_outputs) {
+		bit2height[po] = 0.0;
+		if (bit2driver.count(po)) {
+			Cell *drv_cell = bit2driver[po];
+			if (IsCombinationalGate(drv_cell)) {
+				s_for_check.insert(drv_cell);
+			}
+		}
+		bit2fanout_bwd[po] = 0;
+	}
+
+	vector<Cell *> gates;
+	GetTopoSortedGates(module, gates);
+
+	for (auto it = gates.rbegin(); it != gates.rend(); ++it) {
+		Cell *cell = *it;
+		log_assert(IsCombinationalGate(cell));
+		SigBit outbit = GetCellOutput(cell);
+		if (!s_for_check.count(cell)) {//只处理是forcheck通过的点
+			continue;
+		}
+		float cone_h = bit2height[outbit];
+		pool<SigBit> cut_selected = bit2cut[outbit];
+		if (!map_result.count(outbit)) {
+			map_result[outbit] = cut_selected;
+		} else {
+			log_error("found cycle at %s\n", log_signal(outbit));
+			continue;
+		}
+		pool<Cell *> cone = cell2cuts[cell][cut_selected];
+		for (Cell *cell : cone) {
+			SigBit tmpbit = GetCellOutput(cell);
+			bit2height[tmpbit] = max(bit2height[tmpbit], cone_h);
+		}
+		for (auto &bit : cut_selected) {
+			bit2fanout_bwd[bit]++;
+			bit2height[bit] = max(bit2height[bit], cone_h + 1);
+			if (bit2driver.count(bit)) {
+				Cell *drv_cell = bit2driver[bit];
+				if (IsCombinationalGate(drv_cell)) {
+					s_for_check.insert(drv_cell);
+				}
+			}
+		}
+	}
+
+        pool<SigBit> fo_bits;
+        for (auto &pp : bit2fanout_est)
+                fo_bits.insert(pp.first);
+        for (auto &pp : bit2fanout_bwd)
+                fo_bits.insert(pp.first);
+
+        for (auto bit : fo_bits) {
+                size_t observed = 0;
+                if (bit2fanout_bwd.count(bit)) {
+                        observed = bit2fanout_bwd[bit];
+                }
+                if (bit2reader.count(bit)) {
+                        for (auto reader : bit2reader[bit]) {
+                                observed += IsGTP(reader);
+                        }
+                }
+                observed = std::max<size_t>(1, observed);
+
+                float prev = bit2fanout_est.count(bit) ? bit2fanout_est[bit] : observed;
+                float blended = 0.4f * prev + 0.6f * observed;
+                bit2fanout_est[bit] = std::max<size_t>(1, static_cast<size_t>(std::lround(blended)));
+        }
+        bit2cut.clear();
+        for (auto &p : map_result) {
+                bit2cut[p.first] = p.second;
+        }
+        return true;
+}
+/*
+specify port dirction of each cell for yosys_celltypes/modwalker to
+delcare the input and output pin name of gtp cell
+after that, using yosys_celltypes.cell_output(cell->type,portname) to get port direction
+*/
 void SetPangoCellTypes(CellTypes *ct)
 {
 	ct->setup_type(ID(GTP_ADC_E2),
@@ -2425,7 +3265,183 @@ void SetPangoCellTypes(CellTypes *ct)
 	ct->setup_type(ID(GTP_ZEROHOLDDELAY), {ID(DI)}, {ID(DO)}, false);
 }
 
+// generate all cut rooted on cell output
+// save it to cell2cuts
+bool 	GenerateCuts(Cell *cell)
+{
+	if (!IsCombinationalGate(cell)) {
+		return false;
+	}
+	dict<pool<SigBit>, pool<Cell *>> &cuts = cell2cuts[cell];//取得cell的映射地址cuts &cuts存储了该cell的所有信息，此时为空
+	pool<SigBit> default_cut;//pool保证元素唯一
+	GetCellInputsSet(cell, default_cut);//取得cell的fanin作为default——cut
+	pool<Cell *> cone;
+	cone.insert(cell);
+	cuts[default_cut] = cone;
+	vector<pool<SigBit>> tmp_cuts;//迭代边界条件
+	tmp_cuts.push_back(default_cut);
+	for (size_t i = 0; i < MAX_CUT_SIZE_PRE_CELL && i < tmp_cuts.size(); ++i) {
+		pool<SigBit> cut = tmp_cuts[i];
+		if (cut.size() > LUT_SIZE) {
+			continue;
+		}
+		for (SigBit &cur_bit : cut) {
+			pool<SigBit> ncut = cut;
+			Cell *drv = bit2driver.count(cur_bit) ? bit2driver[cur_bit] : nullptr;
+			if (!drv || !IsCombinationalGate(drv)) {
+				continue;
+			}
+			ncut.erase(cur_bit);
+			pool<SigBit> tinputs;
+			GetCellInputsSet(drv, tinputs);
+			ncut.insert(tinputs.begin(), tinputs.end());
 
+			if (ncut.size() > LUT_SIZE) {
+				continue;
+			}
+			if (cuts.count(ncut)) {
+				continue;
+			}
+			cuts.insert(ncut);
+			tmp_cuts.push_back(ncut);
+			pool<Cell *> ncone = cuts[cut];
+			ncone.insert(drv);
+			cuts[ncut] = ncone;
+		}
+	}
+	log_debug("cell %s has %ld cuts\n", cell->name.c_str(), tmp_cuts.size());
+	return true;
+}
+
+bool GenerateCuts(Module *module)
+{
+	pool<Cell *> cells;
+	GetGates(module, cells); // generate cuts for all combinational gates
+	for (Cell *cell : cells) {
+		GenerateCuts(cell);
+	}
+	return true;
+}
+
+// evaluate SigBit out is true or false base on inputs(bit_map)
+State StateEval(dict<SigBit, State> &bit_map, SigBit out)
+{
+	if (bit_map.count(out)) {
+		return bit_map[out];
+	}
+	Cell *cell = bit2driver[out];
+	if (!cell) {
+		return State::Sx;
+	}
+
+	vector<SigBit> bits = cell2bits[cell];
+	if (IsAND(cell)) {
+		SigBit tout = bits[0];
+		for (size_t i = 1; i < bits.size(); i++) {
+			State tmp = StateEval(bit_map, bits[i]);
+			if (tmp == State::S0) {
+				bit_map[tout] = State::S0;
+				return State::S0;
+			} else if (tmp == State::S1) {
+				continue;
+			} else {
+				log_error("Cannot evaluate %s \n", log_signal(tout));
+				bit_map[tout] = State::Sx;
+				return State::Sx;
+			}
+		}
+		return State::S1;
+	} else if (IsOR(cell)) {
+		SigBit tout = bits[0];
+		for (size_t i = 1; i < bits.size(); i++) {
+			State tmp = StateEval(bit_map, bits[i]);
+			if (tmp == State::S1) {
+				bit_map[tout] = State::S1;
+				return State::S1;
+			} else if (tmp == State::S0) {
+				continue;
+			} else {
+				log_error("Cannot evaluate %s \n", log_signal(tout));
+				bit_map[tout] = State::Sx;
+				return State::Sx;
+			}
+		}
+		return State::S0;
+	} else if (IsNOT(cell)) {
+		SigBit tout = bits[0];
+		State tmp = StateEval(bit_map, bits[1]);
+		if (tmp == State::S0) {
+			bit_map[tout] = State::S1;
+			return State::S1;
+		} else if (tmp == State::S1) {
+			bit_map[tout] = State::S0;
+			return State::S0;
+		} else {
+			log_error("Cannot evaluate %s \n", log_signal(tout));
+		}
+	} else if (IsMUX(cell)) {
+		SigBit tout = bits[0];
+		SigSpec sig = cell->getPort(ID(S));
+		sig = sigmap(sig);
+		log_assert(sig.size());
+		SigBit sel_bit = sig[0];
+		sig = cell->getPort(ID(A));
+		sig = sigmap(sig);
+		log_assert(sig.size());
+		SigBit i0_bit = sig[0];
+		sig = cell->getPort(ID(B));
+		sig = sigmap(sig);
+		log_assert(sig.size());
+		SigBit i1_bit = sig[0];
+		State sel_state = StateEval(bit_map, sel_bit);
+		if (sel_state == State::S0) {
+			State tmp = StateEval(bit_map, i0_bit);
+			bit_map[tout] = tmp;
+			return tmp;
+		} else if (sel_state == State::S1) {
+			State tmp = StateEval(bit_map, i1_bit);
+			bit_map[tout] = tmp;
+			return tmp;
+		}
+	} else if (IsXOR(cell)) {
+		SigBit tout = bits[0];
+		State tmp0 = StateEval(bit_map, bits[1]);
+		State tmp1 = StateEval(bit_map, bits[2]);
+		if (tmp0 == State::Sx || tmp1 == State::Sx) {
+			log_error("Cannot evaluate %s \n", log_signal(tout));
+			bit_map[tout] = State::Sx;
+			return State::Sx;
+		} else if (tmp0 == tmp1) {
+			bit_map[tout] = State::S0;
+			return State::S0;
+		} else {
+			bit_map[tout] = State::S1;
+			return State::S1;
+		}
+	} else {
+		log_error("unhandled cell %s \n", cell->type.c_str());
+	}
+	return State::Sx;
+}
+
+vector<bool> GetCutInit(const vector<SigBit> &cut, SigBit out)
+{
+	log_assert(cut.size() <= LUT_SIZE && cut.size() >= 1);
+	size_t bits_num = size_t(1 << cut.size());
+	vector<bool> cut_init(bits_num, false);
+	for (size_t i = 0; i < bits_num; i++) {
+		dict<SigBit, State> bit_map;
+		for (size_t n = 0; n < cut.size(); n++)
+			bit_map[cut[n]] = ((i >> n) & 1) ? State::S1 : State::S0;
+
+		State value = StateEval(bit_map, out);
+		if (value == State::Sx) {
+			log_error("Cannot evaluate %s \n", log_signal(out));
+		}
+		cut_init[i] = value == State::S1;
+	}
+	return cut_init;
+}
 
 RTLIL::Cell *addLut(Module *module, const pool<SigBit> &cut, const RTLIL::SigBit &sig_z)
 {
@@ -2476,19 +3492,6 @@ RTLIL::Cell* addDualOutputLut(Module *module,
     pool<SigBit> cut_a = bit2cut[out_a];
     pool<SigBit> cut_b = bit2cut[out_b];
 
-    auto sanitize_cut = [&](const pool<SigBit> &cut) {
-        pool<SigBit> clean;
-        for (auto bit : cut) {
-            if (bit == out_a || bit == out_b)
-                continue;
-            clean.insert(bit);
-        }
-        return clean;
-    };
-
-    cut_a = sanitize_cut(cut_a);
-    cut_b = sanitize_cut(cut_b);
-
     bool a_is6 = cut_a.size() == 6;
     bool b_is6 = cut_b.size() == 6;
 
@@ -2500,13 +3503,13 @@ RTLIL::Cell* addDualOutputLut(Module *module,
     if (a_is6 && !b_is6) {
         out_z = out_a;
         out_z5 = out_b;
-        cut_z = sanitize_cut(cut_a);
-        cut_z5 = sanitize_cut(cut_b);
+        cut_z = cut_a;
+        cut_z5 = cut_b;
     } else if (b_is6 && !a_is6) {
         out_z = out_b;
         out_z5 = out_a;
-         cut_z = sanitize_cut(cut_b);
-        cut_z5 = sanitize_cut(cut_a);
+        cut_z = cut_b;
+        cut_z5 = cut_a;
     } else if (a_is6 && b_is6) {
         // 当前不支持 6PI + 6PI 融合
         return nullptr;
@@ -2670,8 +3673,8 @@ bool Cone2ToLUTs(Module *module,
         std::vector<SigBit> outputs = {out1, out2};
         Cell *lut = addDualOutputLut(module, inputs, outputs,bit2cut); // 需要实现 dual-output addLut
         if (!lut) {
-           // log_warning("Bit2oCut: dual-output LUT build failed for %s/%s, falling back to single-output mapping.\n",
-            //            log_signal(out1), log_signal(out2));
+            log_warning("Bit2oCut: dual-output LUT build failed for %s/%s, falling back to single-output mapping.\n",
+                        log_signal(out1), log_signal(out2));
             continue;
         }
 
@@ -2703,6 +3706,103 @@ bool Cone2ToLUTs(Module *module,
 }
 
 
+bool CheckCellWidth(Module *module)
+{
+	log_debug("check cell width in module\n");
+	for (Cell *cell : module->cells()) {
+		if (IsMUX(cell)) {
+
+		} else if (IsAND(cell) || IsOR(cell) || IsXOR(cell)) {
+
+		} else if (IsNOT(cell) || IsGTP(cell)) {
+
+		} else if (cell) {
+			log_error("find unsupported cell %s (%s).\n", cell->name.c_str(), cell->type.c_str());
+		}
+	}
+
+	log_debug("Init driver/reader dict\n");
+	for (auto &cell_iter : module->cells_) {
+		Cell *cell = cell_iter.second;
+		if (!yosys_celltypes.cell_known(cell->type)) {
+			log_warning("cell %s (%s) is not a know type.\n", cell->name.c_str(), cell->type.c_str());
+			continue;
+		}
+
+		vector<SigBit> all_bits;
+		vector<SigBit> input_bits;
+		for (auto &conn : cell->connections()) {
+			IdString portname = conn.first;
+			// (use sigmap to get a uniqe signal name)
+			RTLIL::SigSpec sig = sigmap(conn.second);
+			if (yosys_celltypes.cell_output(cell->type, portname)) {
+				if (sig.size() == 0) {
+					continue;
+				}
+				if (IsCombinationalCell(cell) && !sig.is_bit()) {
+					log_error("cell %s %s  sig %s is not a bit=%d\n", cell->name.c_str(), cell->type.c_str(),
+						  sig.as_string().c_str(), sig.size());
+				}
+				for (int i = 0; i < sig.size(); i++) {
+					bit2driver[sig[i]] = cell;
+					all_bits.push_back(sig[i]);
+				}
+			} else if (yosys_celltypes.cell_input(cell->type, portname)) {
+				for (int i = 0; i < sig.size(); i++) {
+					bit2reader[sig[i]].push_back(cell);
+					input_bits.push_back(sig[i]);
+				}
+			}
+		}
+		if (all_bits.size() < 1 && cell->type != ID(GTP_GRS)) {
+			log_warning(" cell %s(%s) have not any output.\n", cell->name.c_str(), cell->type.c_str());
+		}
+		for (auto bit : input_bits) {
+			all_bits.push_back(bit);
+		}
+		cell2bits[cell] = all_bits;
+	}
+	return true;
+}
+
+struct MapperPass : public Pass {
+	MapperPass() : Pass("mapper", "synthesis for Pango FPGA. Mapper main function.") {}
+	void help() override
+	{
+		//   |---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|
+		log("\n");
+		log("    mapper [options] [selection]\n");
+	}
+	bool write_out_black_list;
+	void clear_flags() override { write_out_black_list = false; }
+	void execute(std::vector<std::string> args, RTLIL::Design *design) override
+	{
+		log_header(design, "Start MapperPass\n");
+
+		size_t argidx;
+		for (argidx = 1; argidx < args.size(); argidx++) {
+			if (args[argidx] == "-ilut") {
+				using_internel_lut_type = true;
+				continue;
+			}
+			if (args[argidx] == "-interation" && argidx + 1 < args.size()) {
+				MAX_INTERATIONS = max(atoi(args[++argidx].c_str()), 3);
+				continue;
+			}
+			break;
+		}
+		extra_args(args, argidx, design);
+
+		Module *module = design->top_module();
+		if (module == nullptr)
+			log_cmd_error("No top module found.\n");
+
+		log_header(design, "Continuing MapperPass pass.\n");
+		MapperInit(module);
+		MapperMain(module);
+		log_pop();
+	}
+} MapperPass;
 
 
 struct testpass:public ScriptPass{
@@ -2710,16 +3810,16 @@ struct testpass:public ScriptPass{
 	bool Score =false;
 	string top_module_name;
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override{
-		for (auto &arg : args) {
-			 if (arg == "-h") {
+        for (auto &arg : args) {
+                if (arg == "-h") {
                 log("\nUsage: test_pango [options]\n");
-                log("  -t     Enable TEST mode\n");
                 log("  -h     Show this help message\n\n");
-                return; // 打印帮助后退出，不执行脚本
+                return; //Exit after printing the help without executing the script 
             }
-			else if (arg == "-c") {
-				Score =true;
+                else if (arg == "-c") {
+                        Score = true;
             }
+        
         }
 		log_header(design, "Start test_pango\n");
 		log_push();
@@ -2731,6 +3831,7 @@ struct testpass:public ScriptPass{
 	if (!module) log_cmd_error("No top module found\n");
 	top_module_name = module->name.str();
 	std::string input_file ="/home/yujingning/ziguang/test/"+ top_module_name.substr(1)+ ".v";
+			MapperInit(module);
 			MapperMain(module);
 			if(Score){
 				run("check -mapped");
@@ -2742,5 +3843,102 @@ struct testpass:public ScriptPass{
 }testpass;
 
 
+struct SynthPangoPass : public ScriptPass {
+	SynthPangoPass() : ScriptPass("synth_pango", "synthesis script pass for Pango FPGA. Map gate to GTP_LUT.") {}
+	void help() override
+	{
+		//   |---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|
+		log("\n");
+		log("    synth_pango [options] [selection]\n");
+	}
 
+	string input_verilog_file;
+	string output_verilog_file;
+	string top_module_name;
+	void clear_flags() override
+	{
+		using_internel_lut_type = false;
+		output_verilog_file = "";
+		top_module_name = "";
+	}
+	void execute(std::vector<std::string> args, RTLIL::Design *design) override
+	{
+		string run_from, run_to;
+		clear_flags();
+
+		size_t argidx;
+		for (argidx = 1; argidx < args.size(); argidx++) {
+			if (args[argidx] == "-top" && argidx + 1 < args.size()) {
+				top_module_name = args[++argidx];
+				continue;
+			}
+			if (args[argidx] == "-input" && argidx + 1 < args.size()) {
+				input_verilog_file = args[++argidx];
+				continue;
+			}
+			if (args[argidx] == "-interation" && argidx + 1 < args.size()) {
+				MAX_INTERATIONS = max(atoi(args[++argidx].c_str()), 3);//
+				continue;
+			}
+			if (args[argidx] == "-run" && argidx + 1 < args.size()) {
+				size_t pos = args[argidx + 1].find(':');
+				if (pos == std::string::npos)
+					break;
+				run_from = args[++argidx].substr(0, pos);
+				run_to = args[argidx].substr(pos + 1);
+				continue;
+			}
+			break;
+		}
+
+		extra_args(args, argidx, design);
+		if (!design->full_selection())
+			log_cmd_error("This command only operates on fully selected designs!\n");
+
+		log_header(design, "Start synth_pango\n");
+		log_push();
+
+		run_script(design, run_from, run_to);
+
+		log_pop();
+	}
+	void script() override
+	{
+		if (check_label("begin")) {
+#if defined(_WIN32)
+			run("read_verilog -lib ./techlibs/pango/pango_lib.v");
+#else
+			run("read_verilog -lib +/pango/pango_lib.v");
+#endif
+			run(stringf("read_verilog -icells %s", input_verilog_file.c_str()));
+			if (top_module_name.size() > 0) {
+				run(stringf("hierarchy -check -top %s", top_module_name.c_str()));
+			}
+		}
+
+		Module *module = active_design->top_module();
+		if (module == nullptr)
+			log_cmd_error("No top module found.\n");
+		if (top_module_name.size() == 0) {
+			top_module_name = module->name.c_str();
+		}
+
+		if (check_label("pango")) {
+			run(stringf("hierarchy -check -top %s;;", top_module_name.c_str()));
+			run("synth");
+			run("wreduce");
+			MapperInit(module);
+			MapperMain(module);
+		}
+		if (check_label("check")) {
+			run("check -mapped");
+		}
+		if (check_label("verilog")) {
+			run(stringf("write_verilog -noexpr -noattr %s_syn.v", top_module_name.c_str() + 1));
+		}
+		if (check_label("score")) {
+			run(stringf("score -before %s -after %s_syn.v", input_verilog_file.c_str(), top_module_name.c_str() + 1));
+		}
+	}
+} SynthPangoPass;
 PRIVATE_NAMESPACE_END
